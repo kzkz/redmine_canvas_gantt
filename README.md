@@ -4,6 +4,8 @@
 
 A fast, low-risk, Canvas-based Gantt chart plugin for Redmine 6.x.
 
+**🌙 This fork adds Dark Mode and 🎌 Japanese national holidays** — [what this fork adds ↓](#what-this-fork-adds)
+
 ## Why this plugin?
 
 - Your Redmine Gantt becomes slow with many issues
@@ -35,6 +37,23 @@ https://www.redmine.org/plugins/redmine_canvas_gantt
 </div>
 
 ---
+
+## What this fork adds
+
+This is a fork of **[tiohsa/redmine_canvas_gantt](https://github.com/tiohsa/redmine_canvas_gantt)** that adds the following; everything else is unchanged from upstream.
+
+### 🌙 Dark mode
+
+- A **Light / Dark / Auto** toggle button in the toolbar.
+- **Auto** follows the surrounding Redmine theme automatically (detected from the page background), so a dark Redmine theme gives a dark Gantt with no setup.
+- The choice is remembered **per user across all projects**.
+- Covers the whole UI: the canvas chart, toolbar, menus, dialogs, help screen and form controls.
+
+### 🎌 Japanese national holidays
+
+- Holidays are shaded on the chart and header like weekends — including **substitute holidays (振替休日)** and **citizen's holidays (国民の休日)**, computed offline (no external service or data file needed).
+- **Hover a holiday** in the timeline header to see its name.
+- Day labels follow the Japanese calendar: Sundays and holidays in red, Saturdays in blue.
 
 ## Overview
 
