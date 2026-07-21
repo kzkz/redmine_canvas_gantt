@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useCallback, useLayoutEffect, useMemo, useState } from 'react';
+import { designTokens } from '../../styles/designTokens';
 import { i18n } from '../../utils/i18n';
 import { useWorkloadStore } from '../../stores/WorkloadStore';
 import { useTaskStore } from '../../stores/TaskStore';
@@ -464,20 +465,20 @@ export const WorkloadCanvasPanel: React.FC<WorkloadCanvasPanelProps> = ({
     }, [finishDrag, hitTestDailyBarAtClientPoint, isScrollInteractionLocked, setFocusedHistogramBar, setHistogramBarHoveredState, setPointerSuppressedState, updateHoverState]);
 
     return (
-        <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', borderTop: '1px solid #e0e0e0', backgroundColor: '#ffffff' }}>
+        <div ref={containerRef} style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', borderTop: `1px solid ${designTokens.borderSubtle}`, backgroundColor: designTokens.appBg }}>
             <div style={{
                 height: '40px',
-                borderBottom: '1px solid #e0e0e0',
+                borderBottom: `1px solid ${designTokens.borderSubtle}`,
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'space-between',
                 padding: '0 16px',
                 fontWeight: 600,
                 fontSize: '12px',
-                color: '#666',
+                color: designTokens.textSecondary,
                 textTransform: 'uppercase',
                 letterSpacing: '0.5px',
-                backgroundColor: '#fafafa'
+                backgroundColor: designTokens.surfaceSubtle
             }}>
                 <span>HISTOGRAM (DAILY WORKLOAD)</span>
             </div>
@@ -507,11 +508,11 @@ export const WorkloadCanvasPanel: React.FC<WorkloadCanvasPanelProps> = ({
                         alignItems: 'center',
                         justifyContent: 'center',
                         padding: '24px',
-                        color: '#666',
+                        color: designTokens.textSecondary,
                         fontSize: '13px',
                         lineHeight: '1.5',
                         textAlign: 'center',
-                        backgroundColor: 'rgba(255, 255, 255, 0.92)',
+                        backgroundColor: designTokens.appBg,
                         cursor: 'default'
                     }}>
                         {i18n.t('label_no_workload_data_matches_filters') || 'No workload data matches the current filters.'}

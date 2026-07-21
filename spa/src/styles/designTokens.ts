@@ -1,3 +1,5 @@
+import { resolveIsDark } from '../utils/colorScheme';
+
 export const fontFamilies = {
     ui: '"DM Sans", "Noto Sans JP", "Helvetica Neue", Helvetica, Arial, sans-serif',
     display: '"Outfit", "Helvetica Neue", Helvetica, Arial, sans-serif',
@@ -12,7 +14,10 @@ export const canvasFonts = {
     header: `600 11px ${fontFamilies.data}`
 } as const;
 
-export const designTokens = {
+// Light palette (default). Canvas drawing and inline-styled components read
+// from `designTokens`, which is resolved once at module load to either this or
+// the dark palette based on the OS/browser color-scheme preference.
+const lightTokens = {
     appBg: '#ffffff',
     surfaceSubtle: '#f7f9fc',
     surfaceMuted: '#f3f6fb',
@@ -67,6 +72,9 @@ export const designTokens = {
     parentCap: '#64748b',
     selectedRow: '#e8f0ff',
     weekendBg: '#f8fafc',
+    holidayBg: '#f8fafc',
+    dayLabelSunday: '#d93025',
+    dayLabelSaturday: '#1a73e8',
     rowHover: '#f8fafc',
     threshold: '#f4b8b0',
     focus: '#f59e0b',
@@ -109,4 +117,119 @@ export const designTokens = {
     notificationLink: '#dc2626',
     notificationCritical: '#b42318',
     notificationMuted: '#5f6368'
-} as const;
+};
+
+type DesignTokens = typeof lightTokens;
+
+// Dark palette. Keeps semantic hues (done=green, delayed=red, brand=blue) while
+// moving surfaces/text/borders to a dark scheme consistent with the Redmine
+// Circle dark themes.
+const darkTokens: DesignTokens = {
+    appBg: '#1e1e1e',
+    surfaceSubtle: '#262b31',
+    surfaceMuted: '#22262b',
+    surfaceHover: '#2c3238',
+    surfaceOverlay: 'rgba(0, 0, 0, 0.6)',
+    borderSubtle: '#3a3f45',
+    borderStrong: '#4a5058',
+    textPrimary: '#e4e6e8',
+    textSecondary: '#b0b6bd',
+    textMuted: '#8a9096',
+    brandPrimary: '#4d8bff',
+    brandPrimaryStrong: '#6ea8ff',
+    brandLight: '#22344f',
+    brandTint: 'rgba(77, 139, 255, 0.18)',
+    accentPink: '#ea5ec1',
+    iconActiveDot: '#4d8bff',
+    controlBg: '#2a2f35',
+    controlFg: '#d4d4d4',
+    controlBorder: '#3a3f45',
+    controlBorderStrong: '#4a5058',
+    controlActiveBg: '#243447',
+    controlActiveFg: '#6ea8ff',
+    controlErrorBorder: '#f28b82',
+    controlErrorFg: '#f28b82',
+    controlLoadingFg: '#9aa0a6',
+    menuShadow: '0 4px 12px rgba(0,0,0,0.5)',
+    dialogShadow: '0px 0px 22.576px rgba(0,0,0,0.5), 6.5px 2px 17.5px rgba(0,0,0,0.4)',
+    controlInsetShadow: 'inset 0 1px 2px rgba(0,0,0,0.3)',
+    controlActiveShadow: '0 1px 3px rgba(0,0,0,0.4), 0 1px 2px rgba(0,0,0,0.3)',
+    sidebarProgressTrack: '#3a3f45',
+    sidebarProgressFill: '#50c878',
+    sidebarRootDropBg: '#3a3320',
+    sidebarRootDropBorder: '#f9ab00',
+    sidebarDropTargetBg: '#1f3326',
+    sidebarDropTargetBorder: '#34a853',
+    sidebarSelectedRowBg: '#243447',
+    tooltipBg: '#3a3f45',
+    tooltipFg: '#f0f0f0',
+    tooltipShadow: '0 2px 8px rgba(0,0,0,0.6)',
+    warningBg: '#3a2f1a',
+    warningBgSoft: '#3a3320',
+    warningFg: '#f0b357',
+    disabledFg: '#6b7280',
+    errorBg: '#3a1f1f',
+    errorBorder: '#5a2a2a',
+    errorFg: '#f28b82',
+    taskDone: '#50c878',
+    taskPlanned: 'rgba(180, 190, 180, 0.22)',
+    taskDelayed: '#ef5350',
+    taskDelayedStroke: '#c5382e',
+    dependency: '#6b7686',
+    parentCap: '#8792a3',
+    selectedRow: 'rgba(77, 139, 255, 0.14)',
+    weekendBg: '#24282d',
+    holidayBg: '#24282d',
+    dayLabelSunday: '#ef6b6b',
+    dayLabelSaturday: '#6ea8ff',
+    rowHover: '#2a2f35',
+    threshold: '#5a3230',
+    focus: '#f5b13b',
+    progressLine: '#ef5350',
+    baselineFill: 'rgba(167, 139, 250, 0.20)',
+    baselineStroke: 'rgba(167, 139, 250, 0.55)',
+    baselineMarkerFill: 'rgba(234, 94, 193, 0.95)',
+    baselineMarkerStroke: '#1e1e1e',
+    projectSummaryFill: 'rgba(102, 187, 106, 0.22)',
+    projectSummaryStroke: '#66bb6a',
+    projectSummaryLine: 'rgba(160, 170, 180, 0.4)',
+    versionFill: '#43a047',
+    versionStroke: '#66bb6a',
+    versionProgress: '#81c784',
+    statusNewBg: '#2c2c2c',
+    statusNewText: '#bdbdbd',
+    statusNewBar: '#9e9e9e',
+    statusProgressBg: '#1c3040',
+    statusProgressText: '#64b5f6',
+    statusProgressBar: '#42a5f5',
+    statusDoneBg: '#1f3326',
+    statusDoneText: '#81c784',
+    statusDoneBar: '#66bb6a',
+    statusBlockedBg: '#3a2f1a',
+    statusBlockedText: '#ffb74d',
+    statusBlockedBar: '#ffa726',
+    priorityHighBg: '#3a1f22',
+    priorityHighText: '#ef9a9a',
+    priorityMidBg: '#3a2f1a',
+    priorityMidText: '#ffb74d',
+    priorityDefaultBg: '#2c2c2c',
+    priorityDefaultText: '#bdbdbd',
+    trackerDefectStroke: '#ef6b6b',
+    trackerMilestoneStroke: '#4ade80',
+    trackerTicketStroke: '#60a5fa',
+    trackerTodoStroke: '#6b93f5',
+    trackerDocumentStroke: '#a0a0a6',
+    notificationInfo: '#94a3b8',
+    notificationWarning: '#eab308',
+    notificationLink: '#f87171',
+    notificationCritical: '#f28b82',
+    notificationMuted: '#9aa0a6'
+};
+
+// Resolve the active palette once at module load. Kept intentionally static
+// (no live swap): a scheme change is picked up on reload, mirroring how Redmine
+// itself applies theme changes. The resolution (user toggle → host override →
+// Redmine theme luminance → OS preference) lives in utils/colorScheme.
+export const prefersDarkColorScheme: boolean = resolveIsDark();
+
+export const designTokens: DesignTokens = prefersDarkColorScheme ? darkTokens : lightTokens;

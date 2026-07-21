@@ -1,4 +1,5 @@
 import React from 'react';
+import { designTokens } from '../styles/designTokens';
 import { useUIStore } from '../stores/UIStore';
 import { useTaskStore } from '../stores/TaskStore';
 import { i18n } from '../utils/i18n';
@@ -88,7 +89,7 @@ export const BulkSubtaskCreator = React.forwardRef<BulkSubtaskCreatorHandle, Bul
         return (
             <div style={{
                 marginTop: showTopBorder ? 12 : 0,
-                borderTop: showTopBorder ? '1px solid #e0e0e0' : 'none',
+                borderTop: showTopBorder ? `1px solid ${designTokens.borderSubtle}` : 'none',
                 paddingTop: 8
             }}>
                 <div
@@ -100,11 +101,11 @@ export const BulkSubtaskCreator = React.forwardRef<BulkSubtaskCreatorHandle, Bul
                         transition: 'transform 0.2s',
                         marginRight: 6,
                         fontSize: 10,
-                        color: '#666'
+                        color: designTokens.textSecondary
                     }}>
                         ▶
                     </div>
-                    <div style={{ fontSize: 13, fontWeight: 600, color: '#333' }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: designTokens.textPrimary }}>
                         {i18n.t('label_bulk_subtask_creation') || 'Bulk Ticket Creation'}
                     </div>
                 </div>
@@ -122,7 +123,9 @@ export const BulkSubtaskCreator = React.forwardRef<BulkSubtaskCreatorHandle, Bul
                                 width: '100%',
                                 padding: 8,
                                 fontSize: 13,
-                                border: '1px solid #ccc',
+                                border: `1px solid ${designTokens.controlBorder}`,
+                                backgroundColor: designTokens.controlBg,
+                                color: designTokens.controlFg,
                                 borderRadius: 4,
                                 resize: 'vertical',
                                 marginBottom: 8,
@@ -137,7 +140,7 @@ export const BulkSubtaskCreator = React.forwardRef<BulkSubtaskCreatorHandle, Bul
                                     disabled={loading || !subjects.trim()}
                                     style={{
                                         padding: '6px 12px',
-                                        background: loading || !subjects.trim() ? '#ccc' : '#1a73e8',
+                                        background: loading || !subjects.trim() ? designTokens.controlBorderStrong : designTokens.brandPrimary,
                                         color: '#fff',
                                         border: 'none',
                                         borderRadius: 4,

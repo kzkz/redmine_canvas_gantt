@@ -2,6 +2,7 @@ import type { Task, Viewport, ZoomLevel } from '../types';
 import { getGridScales } from '../utils/grid';
 import { designTokens } from '../styles/designTokens';
 import { getCanvasLogicalSize } from '../utils/canvasDpr';
+import { isJapaneseHoliday } from '../utils/japaneseHolidays';
 
 export class BackgroundRenderer {
     private canvas: HTMLCanvasElement;
@@ -30,7 +31,8 @@ export class BackgroundRenderer {
             ticks.forEach((tick, i) => {
                 const d = new Date(tick.time);
                 const dow = d.getDay();
-                if (dow === 0 || dow === 6) {
+                const holiday = isJapaneseHoliday(d);
+                if (holiday || dow === 0 || dow === 6) {
                     // Calculate width to next tick or default to one day width
                     const w = (i < ticks.length - 1)
                         ? ticks[i + 1].x - tick.x
@@ -38,7 +40,7 @@ export class BackgroundRenderer {
 
                     // Only draw if within canvas
                     if (tick.x + w > 0 && tick.x < width) {
-                        ctx.fillStyle = designTokens.weekendBg;
+                        ctx.fillStyle = holiday ? designTokens.holidayBg : designTokens.weekendBg;
                         ctx.fillRect(Math.floor(tick.x), 0, Math.ceil(w), height);
                     }
                 }

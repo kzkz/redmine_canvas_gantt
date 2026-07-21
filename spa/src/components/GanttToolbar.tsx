@@ -18,6 +18,7 @@ import { useToolbarMenuState } from './gantt/useToolbarMenuState';
 import { useWorkloadStore } from '../stores/WorkloadStore';
 import type { GanttExportHandle } from '../export/types';
 import { DisplaySettingsControls } from './DisplaySettingsControls';
+import { ColorSchemeToggle } from './ColorSchemeToggle';
 import { BaselineControls } from './BaselineControls';
 import {
     applyIndeterminateState,
@@ -1063,7 +1064,7 @@ export const GanttToolbar: React.FC<GanttToolbarProps> = ({ zoomLevel, onZoomCha
                                         step="0.5"
                                         value={capacityThreshold}
                                         onChange={(e) => setCapacityThreshold(Number(e.target.value))}
-                                        style={{ padding: '4px 8px', width: '80px', border: `1px solid ${designTokens.controlBorderStrong}`, borderRadius: '4px' }}
+                                        style={{ padding: '4px 8px', width: '80px', border: `1px solid ${designTokens.controlBorderStrong}`, backgroundColor: designTokens.controlBg, color: designTokens.controlFg, borderRadius: '4px' }}
                                     />
                                 </label>
 
@@ -1899,6 +1900,8 @@ export const GanttToolbar: React.FC<GanttToolbarProps> = ({ zoomLevel, onZoomCha
                     onToggleDisplaySettingsMenu={() => toggleMenu('displaySettings')}
                     onCloseDisplaySettingsMenu={() => closeMenu('displaySettings')}
                 />
+
+                <ColorSchemeToggle />
 
                 <div
                     ref={rowHeightMenuRef}

@@ -440,3 +440,54 @@ iframe.issue-iframe-loading {
   font-weight: 500 !important;
   color: var(--col-text00) !important;
 }
+
+/* ============================================================
+   Dark mode (2026-07-22): DOM chrome via CSS variables + a few
+   hard-coded light surfaces. Canvas colours are handled in JS
+   (designTokens.ts). Driven by the OS/browser color-scheme.
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --color-primary-200: #2b3a52;
+    --color-surface-subtle: #262b31;
+    --color-surface-muted: #22262b;
+    --color-border-subtle: #3a3f45;
+    --color-border-strong: #4a5058;
+    --tooltip-bg: #3a3f45;
+    --tooltip-fg: #f0f0f0;
+    --tooltip-shadow: 0 2px 8px rgba(0, 0, 0, 0.6);
+    --col-text00: #e4e6e8;
+    --col-text04: #b0b6bd;
+    --col-bg13: #1e1e1e;
+    --shadow-standard: rgba(0, 0, 0, 0.5) 0px 4px 6px;
+    --shadow-ambient: rgba(0, 0, 0, 0.5) 0px 0px 22.576px;
+  }
+
+  .minimax-pill-nav { background-color: rgba(255, 255, 255, 0.06); color: #d4d4d4; }
+  .minimax-pill-nav:hover { background-color: rgba(255, 255, 255, 0.1); }
+
+  .minimax-btn-secondary { background-color: #2a2f35; color: #d4d4d4; }
+  .minimax-btn-secondary:hover { background-color: #333a42; }
+
+  .minimax-card-menu { background-color: #262b31; border-color: #3a3f45; }
+
+  .minimax-datepicker { background-color: #262b31 !important; }
+  .minimax-datepicker .react-datepicker__month-container,
+  .minimax-datepicker .react-datepicker__month,
+  .minimax-datepicker .react-datepicker__header { background-color: #262b31 !important; }
+  .minimax-datepicker .react-datepicker__day { color: #d4d4d4 !important; }
+  .minimax-datepicker .react-datepicker__day:hover { background-color: #333a42 !important; }
+  .minimax-datepicker .react-datepicker__day--outside-month { color: #666 !important; }
+  .minimax-datepicker .react-datepicker__day--keyboard-selected { color: #e4e6e8 !important; }
+  .minimax-datepicker-select,
+  .minimax-datepicker select.react-datepicker__month-select,
+  .minimax-datepicker select.react-datepicker__year-select,
+  .minimax-datepicker-nav-btn,
+  .minimax-datepicker-btn { background-color: #2a2f35 !important; color: #e4e6e8 !important; }
+  .minimax-datepicker-btn--clear:hover { background-color: #3a1f1f !important; }
+
+  .rcg-scroll { scrollbar-color: rgba(200, 208, 220, 0.35) transparent; }
+  .rcg-scroll::-webkit-scrollbar-thumb { background-color: rgba(200, 208, 220, 0.28); }
+  .rcg-scroll:hover::-webkit-scrollbar-thumb { background-color: rgba(200, 208, 220, 0.4); }
+}

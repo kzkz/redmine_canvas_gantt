@@ -1,4 +1,5 @@
 import React from 'react';
+import { designTokens } from '../../styles/designTokens';
 import { useWorkloadStore } from '../../stores/WorkloadStore';
 import { useTaskStore } from '../../stores/TaskStore';
 import { useUIStore } from '../../stores/UIStore';
@@ -39,24 +40,24 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
     }, [scrollTop]);
 
     if (!workloadData) {
-        return <div style={{ padding: '10px', color: '#666', fontSize: '13px' }}>{i18n.t('label_loading') || 'Loading...'}</div>;
+        return <div style={{ padding: '10px', color: designTokens.textSecondary, fontSize: '13px' }}>{i18n.t('label_loading') || 'Loading...'}</div>;
     }
 
     return (
         <div
             data-testid="workload-sidebar"
-            style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, width: '100%', height: '100%', borderTop: '1px solid #e0e0e0', backgroundColor: '#fafafa' }}
+            style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0, width: '100%', height: '100%', borderTop: `1px solid ${designTokens.borderSubtle}`, backgroundColor: designTokens.surfaceSubtle }}
         >
             <div style={{
                 height: '40px',
-                borderBottom: '1px solid #e0e0e0',
+                borderBottom: `1px solid ${designTokens.borderSubtle}`,
                 display: 'grid',
                 gridTemplateColumns: `minmax(0, 1fr) ${METRIC_COLUMN_WIDTH}px ${METRIC_COLUMN_WIDTH}px ${OVERLOAD_COLUMN_WIDTH}px`,
                 alignItems: 'center',
                 padding: '0 16px',
                 fontWeight: 600,
                 fontSize: '12px',
-                color: '#666',
+                color: designTokens.textSecondary,
                 textTransform: 'uppercase',
                 letterSpacing: '0.5px'
             }}>
@@ -94,7 +95,7 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                                     data-testid={`workload-sidebar-row-${assignee.assigneeId}`}
                                     style={{
                                         height: `${rowHeight}px`,
-                                        borderBottom: '1px solid #f0f0f0',
+                                        borderBottom: `1px solid ${designTokens.borderSubtle}`,
                                         padding: '8px 16px',
                                         display: 'grid',
                                         gridTemplateColumns: `minmax(0, 1fr) ${METRIC_COLUMN_WIDTH}px ${METRIC_COLUMN_WIDTH}px ${OVERLOAD_COLUMN_WIDTH}px`,
@@ -110,7 +111,7 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                                             minWidth: 0,
                                             fontWeight: 600,
                                             fontSize: '14px',
-                                            color: '#333',
+                                            color: designTokens.textPrimary,
                                             whiteSpace: 'nowrap',
                                             overflow: 'hidden',
                                             textOverflow: 'ellipsis',
@@ -121,13 +122,13 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                                     </div>
                                     <div
                                         data-testid={`workload-sidebar-peak-${assignee.assigneeId}`}
-                                        style={{ gridColumn: '2 / 3', gridRow: '2 / 3', textAlign: 'right', fontSize: '12px', color: '#666' }}
+                                        style={{ gridColumn: '2 / 3', gridRow: '2 / 3', textAlign: 'right', fontSize: '12px', color: designTokens.textSecondary }}
                                     >
                                         {assignee.peakLoad.toFixed(1)}h
                                     </div>
                                     <div
                                         data-testid={`workload-sidebar-total-${assignee.assigneeId}`}
-                                        style={{ gridColumn: '3 / 4', gridRow: '2 / 3', textAlign: 'right', fontSize: '12px', color: '#666' }}
+                                        style={{ gridColumn: '3 / 4', gridRow: '2 / 3', textAlign: 'right', fontSize: '12px', color: designTokens.textSecondary }}
                                     >
                                         {assignee.totalLoad.toFixed(1)}h
                                     </div>
@@ -163,8 +164,8 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                                                     }
                                                 }}
                                                 style={{
-                                                    backgroundColor: '#fce8e6',
-                                                    color: '#d93025',
+                                                    backgroundColor: designTokens.errorBg,
+                                                    color: designTokens.errorFg,
                                                     padding: '2px 6px',
                                                     borderRadius: '4px',
                                                     fontSize: '11px',
@@ -181,7 +182,7 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                                                     width: '32px',
                                                     fontSize: '11px',
                                                     fontWeight: 600,
-                                                    color: '#666',
+                                                    color: designTokens.textSecondary,
                                                     textAlign: 'right',
                                                     visibility: overloadCycleInfo ? 'visible' : 'hidden'
                                                 }}
@@ -195,7 +196,7 @@ export const WorkloadSidebar: React.FC<WorkloadSidebarProps> = ({
                         })}
                     </div>
                 ) : (
-                    <div style={{ padding: '16px', color: '#666', fontSize: '13px', lineHeight: '1.5' }}>
+                    <div style={{ padding: '16px', color: designTokens.textSecondary, fontSize: '13px', lineHeight: '1.5' }}>
                         {i18n.t('label_no_workload_data_matches_filters') || 'No workload data matches the current filters.'}
                     </div>
                 )}

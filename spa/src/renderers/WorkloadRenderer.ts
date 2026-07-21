@@ -2,6 +2,7 @@ import type { Viewport, ZoomLevel } from '../types';
 import { getGridScales } from '../utils/grid';
 import { canvasFonts, designTokens } from '../styles/designTokens';
 import { getCanvasLogicalSize, snapTextPosition, snapLinePosition } from '../utils/canvasDpr';
+import { isJapaneseHoliday } from '../utils/japaneseHolidays';
 import type { AssigneeWorkload, DailyWorkload, WorkloadData } from '../services/WorkloadLogicService';
 
 export interface WorkloadRenderState {
@@ -155,13 +156,14 @@ export class WorkloadRenderer {
             ticks.forEach((tick, i) => {
                 const d = new Date(tick.time);
                 const dow = d.getDay();
-                if (dow === 0 || dow === 6) {
+                const holiday = isJapaneseHoliday(d);
+                if (holiday || dow === 0 || dow === 6) {
                     const w = (i < ticks.length - 1)
                         ? ticks[i + 1].x - tick.x
                         : (24 * 60 * 60 * 1000) * viewport.scale;
 
                     if (tick.x + w > 0 && tick.x < logicalWidth) {
-                        ctx.fillStyle = WorkloadRenderer.WEEKEND_BG;
+                        ctx.fillStyle = holiday ? designTokens.holidayBg : WorkloadRenderer.WEEKEND_BG;
                         ctx.fillRect(Math.floor(tick.x), 0, Math.ceil(w), logicalHeight);
                     }
                 }

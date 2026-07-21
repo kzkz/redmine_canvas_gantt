@@ -1,8 +1,10 @@
-import React, { useCallback, useImperativeHandle, useLayoutEffect, useRef } from 'react';
+import React, { useCallback, useImperativeHandle, useLayoutEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { useTaskStore } from '../stores/TaskStore';
 import { getGridScales } from '../utils/grid';
 import { canvasFonts, designTokens } from '../styles/designTokens';
 import { resizeCanvasForDpr, snapTextPosition, snapLinePosition } from '../utils/canvasDpr';
+import { isJapaneseHoliday, japaneseHolidayName } from '../utils/japaneseHolidays';
 
 export interface TimelineHeaderHandle {
     getCanvas: () => HTMLCanvasElement | null;
@@ -127,16 +129,18 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
             ctx.fillStyle = designTokens.appBg;
             ctx.fillRect(0, y, cssWidth, h);
 
-            // Weekends
+            // Weekends & Japanese holidays
             if (zoomLevel === 2) { // Day View mainly
                 scales.bottom.forEach((tick, i) => {
                     const d = new Date(tick.time);
-                    if (d.getDay() === 0 || d.getDay() === 6) {
+                    const dow = d.getDay();
+                    const holiday = isJapaneseHoliday(d);
+                    if (holiday || dow === 0 || dow === 6) {
                         let w = 50; // default
                         if (i < scales.bottom.length - 1) w = scales.bottom[i + 1].x - tick.x;
                         else w = (24 * 3600 * 1000 * viewport.scale);
 
-                        ctx.fillStyle = designTokens.weekendBg;
+                        ctx.fillStyle = holiday ? designTokens.holidayBg : designTokens.weekendBg;
                         ctx.fillRect(tick.x, y, w, h);
                     }
                 });
@@ -163,6 +167,16 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
                 const textX = tick.x + width / 2;
                 const textY = y + h / 2 + 4;
 
+                // Colour day labels like a Japanese calendar: Sundays/holidays red,
+                // Saturdays blue (day view only; other zooms keep the base colour).
+                if (zoomLevel === 2) {
+                    const d = new Date(tick.time);
+                    const dow = d.getDay();
+                    if (isJapaneseHoliday(d) || dow === 0) ctx.fillStyle = designTokens.dayLabelSunday;
+                    else if (dow === 6) ctx.fillStyle = designTokens.dayLabelSaturday;
+                    else ctx.fillStyle = designTokens.textPrimary;
+                }
+
                 ctx.fillText(tick.label, snapTextPosition(textX), snapTextPosition(textY));
             });
 
@@ -184,9 +198,58 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
         getCanvas: () => canvasRef.current
     }), []);
 
+    // Holiday-name tooltip (day view). Rendered as a custom element positioned to
+    // the upper-right of the cursor — the native title tooltip sits under the
+    // cursor and is hard to read. Portaled to <body> so it is never clipped.
+    const [holidayTip, setHolidayTip] = useState<{ x: number; y: number; text: string } | null>(null);
+    const handleMouseMove = useCallback((event: React.MouseEvent<HTMLCanvasElement>) => {
+        const canvas = canvasRef.current;
+        if (!canvas || zoomLevel !== 2) { setHolidayTip(null); return; }
+        const x = event.clientX - canvas.getBoundingClientRect().left;
+        const ticks = getGridScales(viewport, zoomLevel).bottom;
+        let text = '';
+        for (let i = 0; i < ticks.length; i++) {
+            const nextX = i < ticks.length - 1 ? ticks[i + 1].x : Infinity;
+            if (x >= ticks[i].x && x < nextX) {
+                text = japaneseHolidayName(new Date(ticks[i].time)) ?? '';
+                break;
+            }
+        }
+        setHolidayTip(text ? { x: event.clientX, y: event.clientY, text } : null);
+    }, [viewport, zoomLevel]);
+    const handleMouseLeave = useCallback(() => setHolidayTip(null), []);
+
     return (
         <div style={{ height: 48, backgroundColor: designTokens.surfaceSubtle, borderBottom: `1px solid ${designTokens.borderSubtle}`, overflow: 'hidden' }}>
-            <canvas ref={canvasRef} height={48} style={{ display: 'block' }} />
+            <canvas
+                ref={canvasRef}
+                height={48}
+                style={{ display: 'block' }}
+                onMouseMove={handleMouseMove}
+                onMouseLeave={handleMouseLeave}
+            />
+            {holidayTip && createPortal(
+                <div
+                    style={{
+                        position: 'fixed',
+                        left: holidayTip.x + 12,
+                        top: holidayTip.y - 12,
+                        transform: 'translateY(-100%)',
+                        pointerEvents: 'none',
+                        zIndex: 10000,
+                        background: designTokens.tooltipBg,
+                        color: designTokens.tooltipFg,
+                        font: canvasFonts.body,
+                        padding: '3px 8px',
+                        borderRadius: 4,
+                        whiteSpace: 'nowrap',
+                        boxShadow: designTokens.tooltipShadow,
+                    }}
+                >
+                    {holidayTip.text}
+                </div>,
+                document.body
+            )}
         </div>
     );
 });

@@ -587,38 +587,38 @@ export const HelpDialog: React.FC = () => {
                     width: '100%',
                     maxWidth: '1200px',
                     height: '100%',
-                    backgroundColor: '#ffffff',
+                    backgroundColor: designTokens.appBg,
                     borderRadius: '13px',
-                    boxShadow: '0px 0px 22.576px rgba(0,0,0,0.08), 6.5px 2px 17.5px rgba(44,30,116,0.11)',
+                    boxShadow: designTokens.dialogShadow,
                     display: 'flex',
                     flexDirection: 'column',
                     overflow: 'hidden',
                     boxSizing: 'border-box',
-                    border: '1px solid rgba(0,0,0,0.06)'
+                    border: `1px solid ${designTokens.borderSubtle}`
                 }}
             >
                 <div
                     style={{
                         flex: '0 0 auto',
                         padding: '16px 24px',
-                        borderBottom: `1px solid rgba(0,0,0,0.06)`,
+                        borderBottom: `1px solid ${designTokens.borderSubtle}`,
                         display: 'flex',
                         justifyContent: 'space-between',
                         alignItems: 'center',
-                        backgroundColor: '#ffffff'
+                        backgroundColor: designTokens.surfaceSubtle
                     }}
                 >
-                    <h2 style={{ margin: 0, fontFamily: fontFamilies.display, fontSize: '18px', fontWeight: 600, color: '#222222', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <h2 style={{ margin: 0, fontFamily: fontFamilies.display, fontSize: '18px', fontWeight: 600, color: designTokens.textPrimary, display: 'flex', alignItems: 'center', gap: '8px' }}>
                         {questionIcon}
                         {i18n.t('label_help') || 'Help'}
                     </h2>
                     <button
                         onClick={closeHelpDialog}
                         style={{
-                            background: 'rgba(0,0,0,0.04)',
+                            background: designTokens.surfaceHover,
                             border: 'none',
                             cursor: 'pointer',
-                            color: '#45515e',
+                            color: designTokens.textSecondary,
                             display: 'flex',
                             alignItems: 'center',
                             justifyContent: 'center',
@@ -655,8 +655,8 @@ export const HelpDialog: React.FC = () => {
                     style={{
                         flex: '0 0 auto',
                         padding: '16px 24px',
-                        borderTop: `1px solid rgba(0,0,0,0.06)`,
-                        backgroundColor: '#ffffff',
+                        borderTop: `1px solid ${designTokens.borderSubtle}`,
+                        backgroundColor: designTokens.surfaceSubtle,
                         display: 'flex',
                         justifyContent: 'flex-start'
                     }}
@@ -669,10 +669,10 @@ export const HelpDialog: React.FC = () => {
                             display: 'inline-flex',
                             alignItems: 'center',
                             justifyContent: 'center',
-                            backgroundColor: '#f0f0f0',
+                            backgroundColor: designTokens.surfaceMuted,
                             border: 'none',
                             borderRadius: '9999px',
-                            color: '#222222',
+                            color: designTokens.textPrimary,
                             fontSize: '13px',
                             cursor: 'pointer',
                             fontWeight: 500,

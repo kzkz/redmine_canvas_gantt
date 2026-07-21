@@ -1,4 +1,5 @@
 import React from 'react';
+import { designTokens } from '../../styles/designTokens';
 
 type ColumnMenuItemProps = {
   columnKey: string;
@@ -57,11 +58,11 @@ export const ColumnMenuItem: React.FC<ColumnMenuItemProps> = ({
         alignItems: 'center',
         gap: '8px',
         padding: '4px 0',
-        color: '#444',
+        color: designTokens.textPrimary,
         cursor: isPinned ? 'default' : 'pointer',
         userSelect: 'none',
         opacity: isDragging ? 0.5 : 1,
-        borderTop: isDropBefore ? '1px solid #1a73e8' : '1px solid transparent'
+        borderTop: isDropBefore ? `1px solid ${designTokens.brandPrimary}` : '1px solid transparent'
       }}
     >
     <button
@@ -83,7 +84,7 @@ export const ColumnMenuItem: React.FC<ColumnMenuItemProps> = ({
         touchAction: 'none',
         border: 'none',
         background: 'transparent',
-        color: 'inherit',
+        color: designTokens.textSecondary,
         cursor: draggable ? 'move' : 'default',
         padding: 0
       }}
