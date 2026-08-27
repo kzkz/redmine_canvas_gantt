@@ -17,9 +17,39 @@ function autumnalEquinoxDay(year: number): number {
     return Math.floor(23.2488 + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4));
 }
 
+// 2020/2021: the Olympic special-measures act moved 海の日, スポーツの日 and
+// 山の日 out of their usual slots. The moved dates replace the normal rules for
+// those years — the usual Happy-Monday positions must not match as well.
+const OLYMPIC_MOVED_HOLIDAYS: Record<number, Record<string, string>> = {
+    2020: { '7-23': '海の日', '7-24': 'スポーツの日', '8-10': '山の日' },
+    2021: { '7-22': '海の日', '7-23': 'スポーツの日', '8-8': '山の日' }
+};
+
+// Months whose only statutory holiday is one of the relocated ones above.
+const OLYMPIC_VACATED_MONTHS = [7, 8, 10];
+
+// 2019: one-off holidays enacted for the imperial succession.
+const IMPERIAL_SUCCESSION_2019: Record<string, string> = {
+    '4-30': '休日',
+    '5-1': '天皇即位',
+    '5-2': '休日',
+    '10-22': '即位礼正殿の儀'
+};
+
 // Returns the base (statutory, non-derived) holiday name for the given local
 // date components, or null. dow: 0=Sun .. 6=Sat.
 function baseHolidayName(year: number, month: number, day: number, dow: number): string | null {
+    const key = `${month}-${day}`;
+    if (year === 2019) {
+        const successionHoliday = IMPERIAL_SUCCESSION_2019[key];
+        if (successionHoliday) return successionHoliday;
+    }
+    const moved = OLYMPIC_MOVED_HOLIDAYS[year];
+    if (moved) {
+        const movedHoliday = moved[key];
+        if (movedHoliday) return movedHoliday;
+        if (OLYMPIC_VACATED_MONTHS.includes(month)) return null;
+    }
     switch (month) {
         case 1:
             if (day === 1) return '元日';
