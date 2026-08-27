@@ -2,19 +2,33 @@ import type {
     FilterAssigneeOption,
     FilterOptions,
     FilterProjectOption,
+    FilterTrackerOption,
     Relation,
     Project,
     SavedQuery,
     Task,
+    PersistedTaskState,
     Version,
     TaskStatus
 } from '../types';
-import type { TaskEditMeta, InlineEditSettings, CustomFieldMeta, EditOption } from '../types/editMeta';
+import type { TaskEditMeta, InlineEditSettings, CustomFieldMeta, EditOption, EditMetaCapabilityContext, DraftContract } from '../types/editMeta';
 import type { BaselineSaveScope, BaselineSnapshot, BaselineTaskState } from '../types/baseline';
 import { buildIssueQueryParams, parseResolvedQueryState, type ResolvedQueryState } from '../utils/queryParams';
 import { normalizeQueryContext } from '../query/queryStateCodec';
 import { normalizeBaselineSaveScope, parseBaselineDateValue } from '../utils/baseline';
 import type { QueryContext } from '../query/types';
+import type { BusinessCalendarPayload } from '../types/businessCalendar';
+import { getBusinessCalendarPayload, normalizeBusinessCalendarPayload } from '../utils/businessCalendar';
+import { formatDateOnly, parseDateOnly } from '../utils/dateOnly';
+import { sessionFetch } from './sessionFetch';
+import { decodeMutationFailure, type MutationFailure, type MutationStatusValue } from './mutationOutcome';
+
+export {
+    classifyMutationError,
+    classifyMutationResult,
+    classifyMutationStatus
+} from './mutationOutcome';
+export type { MutationOutcome, MutationOutcomeKind } from './mutationOutcome';
 
 type ApiTask = Record<string, unknown>;
 type ApiRelation = Record<string, unknown>;
@@ -61,17 +75,69 @@ interface ApiData {
     initialState?: ResolvedQueryState;
     queryContext?: QueryContext;
     warnings?: string[];
+    businessCalendar?: BusinessCalendarPayload;
 }
 
-interface BaselineSaveResult {
+export interface MutationMetadata {
+    completeness?: 'complete' | 'partial';
+    invalidatedEntityIds?: string[];
+    deletedEntityIds?: string[];
+    entity?: PersistedTaskState;
+    revision?: number;
+    failure?: MutationFailure;
+}
+
+export type ScheduleMutationChange = {
+    taskId: string;
+    baseRevision: number;
+    startDate?: number | null;
+    dueDate?: number | null;
+    task?: unknown;
+    mutationFields?: Record<string, unknown>;
+};
+
+export type ScheduleMutationResult = MutationMetadata & {
+    status: MutationStatus;
+    operationId: string;
+    entities: PersistedTaskState[];
+    revisions: Record<string, number>;
+    errors?: string[];
+    conflict?: {
+        taskId?: string;
+        expectedRevision?: number;
+        actualRevision?: number;
+    };
+};
+
+interface BaselineSaveResult extends MutationMetadata {
     status: 'ok' | 'error';
     baseline: BaselineSnapshot | null;
     warnings?: string[];
     error?: string;
 }
 
-interface UpdateTaskResult {
-    status: 'ok' | 'conflict' | 'error';
+export type MutationStatus = MutationStatusValue;
+
+export class ApiMutationError extends Error {
+    readonly status: Exclude<MutationStatus, 'ok'>;
+    readonly httpStatus: number;
+    readonly fieldErrors?: Record<string, string>;
+    readonly failure?: MutationFailure;
+
+    constructor(status: Exclude<MutationStatus, 'ok'>, message: string, httpStatus: number, fieldErrors?: Record<string, string>, failure?: MutationFailure) {
+        super(message);
+        this.name = 'ApiMutationError';
+        this.status = status;
+        this.httpStatus = httpStatus;
+        this.fieldErrors = fieldErrors;
+        this.failure = failure;
+    }
+}
+
+interface UpdateTaskResult extends MutationMetadata {
+    status: MutationStatus;
+    entity?: PersistedTaskState;
+    revision?: number;
     lockVersion?: number;
     taskId?: string;
     parentId?: string;
@@ -81,6 +147,8 @@ interface UpdateTaskResult {
 
 export interface BulkCreateSubtasksResult {
     status: 'ok';
+    completeness?: 'complete' | 'partial';
+    invalidatedEntityIds?: string[];
     successCount: number;
     failCount: number;
     results: Array<{
@@ -102,7 +170,7 @@ declare global {
             apiBase: string;
             redmineBase: string;
             authToken: string;
-            apiKey: string;
+            apiKey?: string;
             nonWorkingWeekDays?: number[];
             settings?: InlineEditSettings & { row_height?: string; tracker_icon_map?: string };
             i18n?: Record<string, string>;
@@ -129,11 +197,16 @@ const buildViewContextQuery = (config: RedmineCanvasGanttConfig): string => {
     return params.toString();
 };
 
-const buildJsonHeaders = (config: RedmineCanvasGanttConfig, includeCsrf: boolean = false): HeadersInit => ({
-    'X-Redmine-API-Key': config.apiKey,
-    'Content-Type': 'application/json',
-    ...(includeCsrf ? { 'X-CSRF-Token': config.authToken } : {})
-});
+const buildJsonHeaders = (config: RedmineCanvasGanttConfig, includeCsrf: boolean = false): HeadersInit => {
+    const calendarRevision = includeCsrf ? getBusinessCalendarPayload().revision : null;
+    return {
+        'Content-Type': 'application/json',
+        ...(includeCsrf ? { 'X-CSRF-Token': config.authToken } : {}),
+        ...(calendarRevision
+            ? { 'X-Redmine-Canvas-Gantt-Calendar-Revision': calendarRevision }
+            : {})
+    };
+};
 
 const parseErrorMessage = async (response: Response): Promise<string> => {
     const payload = await response.json().catch(() => ({} as UnknownRecord));
@@ -147,6 +220,162 @@ const parseErrorMessage = async (response: Response): Promise<string> => {
     }
 
     return response.statusText;
+};
+
+const mutationStatusForHttp = (status: number): Exclude<MutationStatus, 'ok'> => {
+    if (status === 409) return 'conflict';
+    if (status === 403) return 'forbidden';
+    if (status === 404) return 'not_found';
+    if (status === 422) return 'validation_error';
+    return 'transient_error';
+};
+
+const parseMutationError = async (response: Response): Promise<ApiMutationError> => {
+    const payload = await response.json().catch(() => ({} as UnknownRecord));
+    const record = asRecord(payload) ?? {};
+    const errors = Array.isArray(record.errors) && record.errors.every(error => typeof error === 'string')
+        ? Object.fromEntries((record.errors as string[]).map((error, index) => [`error_${index}`, error]))
+        : undefined;
+    const message = typeof record.error === 'string' && record.error
+        ? record.error
+        : errors
+            ? Object.values(errors).join(', ')
+            : response.statusText;
+    const failure = decodeMutationFailure(record.failure);
+    return new ApiMutationError(mutationStatusForHttp(response.status), message, response.status, errors, failure);
+};
+
+const parseMutationMetadata = (value: unknown): Pick<UpdateTaskResult, 'completeness' | 'invalidatedEntityIds' | 'deletedEntityIds' | 'failure'> => {
+    const record = asRecord(value);
+    const completeness = record?.completeness;
+    const ids = record?.invalidated_entity_ids;
+    const deletedIds = record?.deleted_entity_ids;
+    const metadata: Pick<UpdateTaskResult, 'completeness' | 'invalidatedEntityIds' | 'deletedEntityIds' | 'failure'> = {};
+    if (completeness === 'complete' || completeness === 'partial') metadata.completeness = completeness;
+    if (Array.isArray(ids)) metadata.invalidatedEntityIds = ids
+        .filter(id => typeof id === 'number' || typeof id === 'string')
+        .map(String);
+    if (Array.isArray(deletedIds)) metadata.deletedEntityIds = deletedIds
+        .filter(id => typeof id === 'number' || typeof id === 'string')
+        .map(String);
+    const failure = decodeMutationFailure(record?.failure);
+    if (failure) metadata.failure = failure;
+    return metadata;
+};
+
+const parseMutationEntity = (value: unknown): PersistedTaskState | undefined => {
+    const record = asRecord(value);
+    if (!record) return undefined;
+    const id = record.id;
+    if (id === undefined || id === null) return undefined;
+    const has = (key: string): boolean => Object.prototype.hasOwnProperty.call(record, key);
+    const parseDate = (key: string): number | undefined => {
+        const candidate = record[key];
+        if (typeof candidate === 'string') return parseDateOnly(candidate) ?? undefined;
+        return undefined;
+    };
+    const parseNullableNumber = (key: string): number | undefined => {
+        const candidate = record[key];
+        return typeof candidate === 'number' ? candidate : undefined;
+    };
+    const parseNullableId = (key: string): string | undefined => {
+        const candidate = record[key];
+        return candidate === null ? undefined : candidate === undefined ? undefined : String(candidate);
+    };
+    const entity: PersistedTaskState = {
+        id: String(id),
+        ...(typeof record.subject === 'string' ? { subject: record.subject } : {}),
+        ...(has('project_id') ? { projectId: parseNullableId('project_id') } : {}),
+        ...(typeof record.project_name === 'string' ? { projectName: record.project_name } : {}),
+        ...(has('start_date') ? { startDate: parseDate('start_date') } : {}),
+        ...(has('due_date') ? { dueDate: parseDate('due_date') } : {}),
+        ...(typeof record.ratio_done === 'number' ? { ratioDone: record.ratio_done } : {}),
+        ...(typeof record.status_id === 'number' ? { statusId: record.status_id } : {}),
+        ...(typeof record.status_name === 'string' ? { statusName: record.status_name } : {}),
+        ...(record.assigned_to_id === null || typeof record.assigned_to_id === 'number' ? { assignedToId: record.assigned_to_id } : {}),
+        ...(record.assigned_to_name === null || typeof record.assigned_to_name === 'string' ? { assignedToName: record.assigned_to_name } : {}),
+        ...(has('parent_id') ? { parentId: parseNullableId('parent_id') } : {}),
+        ...(typeof record.lock_version === 'number' ? { lockVersion: record.lock_version } : {}),
+        ...(has('tracker_id') ? { trackerId: parseNullableNumber('tracker_id') } : {}),
+        ...(typeof record.tracker_name === 'string' ? { trackerName: record.tracker_name } : {}),
+        ...(has('fixed_version_id') ? { fixedVersionId: parseNullableId('fixed_version_id') } : {}),
+        ...(has('priority_id') ? { priorityId: parseNullableNumber('priority_id') } : {}),
+        ...(typeof record.priority_name === 'string' ? { priorityName: record.priority_name } : {}),
+        ...(typeof record.priority_position === 'number' ? { priorityPosition: record.priority_position } : {}),
+        ...(has('author_id') ? { authorId: parseNullableNumber('author_id') } : {}),
+        ...(typeof record.author_name === 'string' ? { authorName: record.author_name } : {}),
+        ...(has('category_id') ? { categoryId: parseNullableNumber('category_id') } : {}),
+        ...(has('category_name') ? { categoryName: typeof record.category_name === 'string' ? record.category_name : undefined } : {}),
+        ...(has('estimated_hours') ? { estimatedHours: parseNullableNumber('estimated_hours') } : {}),
+        ...(typeof record.created_on === 'string' ? { createdOn: record.created_on } : {}),
+        ...(typeof record.updated_on === 'string' ? { updatedOn: record.updated_on } : {}),
+        ...(typeof record.spent_hours === 'number' ? { spentHours: record.spent_hours } : {}),
+        ...(has('fixed_version_name') ? { fixedVersionName: typeof record.fixed_version_name === 'string' ? record.fixed_version_name : undefined } : {}),
+        ...(asRecord(record.custom_field_values) ? { customFieldValues: asRecord(record.custom_field_values) as Task['customFieldValues'] } : {})
+    };
+    return entity;
+};
+
+const parseMutationTaskResult = async (response: Response): Promise<UpdateTaskResult> => {
+    const data = asRecord(await response.json().catch(() => ({}))) ?? {};
+    const entity = parseMutationEntity(data.entity);
+    const revision = typeof data.revision === 'number' ? data.revision : entity?.lockVersion;
+    const rawStatus = data.status;
+    const status: MutationStatus = response.status === 409
+        ? 'conflict'
+        : typeof rawStatus === 'string' && ['ok', 'error', 'validation_error', 'conflict', 'forbidden', 'not_found', 'transient_error'].includes(rawStatus)
+            ? rawStatus as MutationStatus
+            : typeof rawStatus === 'string'
+                ? 'protocol_error'
+                : response.ok ? 'ok' : mutationStatusForHttp(response.status);
+    return {
+        status,
+        ...parseMutationMetadata(data),
+        ...(entity ? { entity } : {}),
+        ...(revision !== undefined ? { revision } : {}),
+        lockVersion: typeof data.lock_version === 'number' ? data.lock_version : entity?.lockVersion,
+        taskId: data.task_id ? String(data.task_id) : entity?.id,
+        parentId: data.parent_id === null ? undefined : (data.parent_id ? String(data.parent_id) : entity?.parentId),
+        siblingPosition: data.sibling_position === 'tail' ? 'tail' : undefined,
+        error: typeof data.error === 'string' ? data.error : undefined
+    };
+};
+
+const parseScheduleMutationResult = async (response: Response): Promise<ScheduleMutationResult> => {
+    const data = asRecord(await response.json().catch(() => ({}))) ?? {};
+    const rawEntities = Array.isArray(data.entities) ? data.entities : [];
+    const entities = rawEntities.map(parseMutationEntity).filter((entity): entity is PersistedTaskState => Boolean(entity));
+    const rawRevisions = asRecord(data.revisions) ?? {};
+    const revisions = Object.entries(rawRevisions).reduce<Record<string, number>>((result, [id, revision]) => {
+        if (typeof revision === 'number') result[String(id)] = revision;
+        return result;
+    }, {});
+    const rawStatus = data.status;
+    const status: MutationStatus = response.status === 409
+        ? 'conflict'
+        : typeof rawStatus === 'string' && ['ok', 'error', 'validation_error', 'conflict', 'forbidden', 'not_found', 'transient_error'].includes(rawStatus)
+            ? rawStatus as MutationStatus
+            : response.ok ? 'ok' : mutationStatusForHttp(response.status);
+    const errors = Array.isArray(data.errors) ? data.errors.filter((error): error is string => typeof error === 'string') : undefined;
+    const rawConflict = asRecord(data.conflict);
+    const conflictTaskId = rawConflict?.task_id ?? rawConflict?.taskId;
+    return {
+        status,
+        operationId: typeof data.operation_id === 'string' ? data.operation_id : '',
+        entities,
+        revisions,
+        ...(errors && errors.length > 0 ? { errors } : {}),
+        ...(rawConflict ? {
+            conflict: {
+                ...(conflictTaskId !== undefined ? { taskId: String(conflictTaskId) } : {}),
+                ...(typeof rawConflict.expected_revision === 'number' ? { expectedRevision: rawConflict.expected_revision } : {}),
+                ...(typeof rawConflict.expectedRevision === 'number' ? { expectedRevision: rawConflict.expectedRevision } : {}),
+                ...(typeof rawConflict.actual_revision === 'number' ? { actualRevision: rawConflict.actual_revision } : {}),
+                ...(typeof rawConflict.actualRevision === 'number' ? { actualRevision: rawConflict.actualRevision } : {})
+            }
+        } : {}),
+        ...parseMutationMetadata(data)
+    };
 };
 
 const parseEditOption = (value: unknown): EditOption | null => {
@@ -302,6 +531,27 @@ const parseFilterAssigneeOption = (value: unknown): FilterAssigneeOption | null 
     };
 };
 
+const parseFilterTrackerOption = (value: unknown): FilterTrackerOption | null => {
+    const record = asRecord(value);
+    if (!record) return null;
+
+    const id = record.id;
+    const name = record.name;
+    const projectIdsRaw = Array.isArray(record.project_ids) ? record.project_ids : [];
+    if ((typeof id !== 'number' && typeof id !== 'string') || typeof name !== 'string') return null;
+
+    const numericId = Number(id);
+    if (!Number.isInteger(numericId) || numericId <= 0) return null;
+
+    return {
+        id: numericId,
+        name,
+        projectIds: projectIdsRaw
+            .filter((projectId): projectId is string | number => typeof projectId === 'string' || typeof projectId === 'number')
+            .map((projectId) => String(projectId))
+    };
+};
+
 const deriveFilterOptionsFromTasks = (tasks: Task[]): FilterOptions => {
     const projects = new Map<string, string>();
     const assignees = new Map<number | null, { name: string | null; projectIds: Set<string> }>();
@@ -342,13 +592,17 @@ const parseFilterOptions = (value: unknown, tasks: Task[]): FilterOptions => {
 
     const projectsRaw = Array.isArray(record.projects) ? record.projects : [];
     const assigneesRaw = Array.isArray(record.assignees) ? record.assignees : [];
+    const hasTrackers = Object.prototype.hasOwnProperty.call(record, 'trackers');
+    const trackersRaw = Array.isArray(record.trackers) ? record.trackers : [];
 
     const projects = projectsRaw.map(parseFilterProjectOption).filter((entry): entry is FilterProjectOption => entry !== null);
     const assignees = assigneesRaw.map(parseFilterAssigneeOption).filter((entry): entry is FilterAssigneeOption => entry !== null);
+    const trackers = trackersRaw.map(parseFilterTrackerOption).filter((entry): entry is FilterTrackerOption => entry !== null);
 
     return {
         projects: projects.length > 0 ? projects : fallback.projects,
-        assignees: assignees.length > 0 ? assignees : fallback.assignees
+        assignees: assignees.length > 0 ? assignees : fallback.assignees,
+        ...(hasTrackers ? { trackers } : {})
     };
 };
 
@@ -437,7 +691,7 @@ const parseBaselineSnapshot = (value: unknown): { snapshot: BaselineSnapshot | n
 export const apiClient = {
     fetchQueries: async (): Promise<SavedQuery[]> => {
         const config = getConfig();
-        const response = await fetch(new URL(`${config.apiBase}/queries.json`, window.location.origin).toString(), {
+        const response = await sessionFetch(new URL(`${config.apiBase}/queries.json`, window.location.origin).toString(), {
             headers: buildJsonHeaders(config)
         });
 
@@ -454,23 +708,19 @@ export const apiClient = {
     fetchData: async (params?: { query?: ResolvedQueryState; queryContext?: QueryContext; rawSearch?: string }): Promise<ApiData> => {
         const config = getConfig();
 
-        const parseDate = (value: string | null | undefined): number | null => {
-            if (!value) return null;
-            const ts = new Date(value).getTime();
-            return Number.isFinite(ts) ? ts : null;
-        };
+        const parseDate = parseDateOnly;
 
         const qs = params?.rawSearch
             ? params.rawSearch.replace(/^\?/, '')
             : buildIssueQueryParams(params?.query ?? {}, { queryContext: params?.queryContext }).toString();
         const url = new URL(`${config.apiBase}/data.json` + (qs ? `?${qs}` : ''), window.location.origin).toString();
 
-        const response = await fetch(url, {
+        const response = await sessionFetch(url, {
             headers: buildJsonHeaders(config)
         });
 
         if (!response.ok) {
-            throw new Error(`API Error: ${response.statusText}`);
+            throw new Error(await parseErrorMessage(response));
         }
 
         const payload = await response.json();
@@ -589,6 +839,7 @@ export const apiClient = {
         const baselinePayload = parseBaselineSnapshot(data.baseline);
         const baseline = baselinePayload.snapshot;
         const mergedWarnings = [...warnings, ...baselinePayload.warnings];
+        const businessCalendar = normalizeBusinessCalendarPayload(data.businessCalendar ?? data.business_calendar);
 
         return {
             tasks,
@@ -602,11 +853,12 @@ export const apiClient = {
             baseline,
             initialState: parseResolvedQueryState(data.initial_state),
             queryContext: data.query_context === undefined ? undefined : normalizeQueryContext(data.query_context),
-            warnings: mergedWarnings
+            warnings: mergedWarnings,
+            businessCalendar
         };
     },
 
-    saveBaseline: async (params?: { query?: ResolvedQueryState; rawSearch?: string; scope?: BaselineSaveScope }): Promise<BaselineSaveResult> => {
+    saveBaseline: async (params?: { query?: ResolvedQueryState; rawSearch?: string; scope?: BaselineSaveScope }, operationId?: string): Promise<BaselineSaveResult> => {
         const config = getConfig();
         const scope = params?.scope ?? 'filtered';
 
@@ -617,14 +869,14 @@ export const apiClient = {
             : '';
         const url = new URL(`${config.apiBase}/baseline.json` + (qs ? `?${qs}` : ''), window.location.origin).toString();
 
-        const response = await fetch(url, {
+        const response = await sessionFetch(url, {
             method: 'POST',
             headers: buildJsonHeaders(config, true),
-            body: JSON.stringify({ scope })
+            body: JSON.stringify({ scope, ...(operationId ? { client_operation_id: operationId } : {}) })
         });
 
         if (!response.ok) {
-            return { status: 'error', baseline: null, error: await parseErrorMessage(response) };
+            throw await parseMutationError(response);
         }
 
         const payload = await response.json();
@@ -639,22 +891,30 @@ export const apiClient = {
             : [];
         return {
             status: typeof root.status === 'string' ? root.status as 'ok' | 'error' : 'ok',
+            ...parseMutationMetadata(root),
             baseline: baselinePayload.snapshot,
             warnings: [...warnings, ...baselinePayload.warnings]
         };
     },
 
-    fetchEditMeta: async (taskId: string, targetProjectId?: number): Promise<TaskEditMeta> => {
+    fetchEditMeta: async (taskId: string, targetProjectId?: number, targetTrackerId?: number, targetStatusId?: number, draftIntent?: Record<string, unknown>): Promise<TaskEditMeta> => {
         const config = getConfig();
         const query = new URLSearchParams(buildViewContextQuery(config));
         if (targetProjectId !== undefined) query.set('target_project_id', String(targetProjectId));
-        const response = await fetch(`${getGlobalApiBase(config)}/tasks/${taskId}/edit_meta.json?${query}`, {
-            headers: buildJsonHeaders(config)
-        });
+        if (targetTrackerId !== undefined) query.set('target_tracker_id', String(targetTrackerId));
+        if (targetStatusId !== undefined) query.set('target_status_id', String(targetStatusId));
+        const response = await sessionFetch(
+            `${getGlobalApiBase(config)}/tasks/${taskId}/edit_meta${draftIntent ? '/preview' : ''}.json?${query}`,
+            draftIntent
+                ? {
+                    method: 'POST',
+                    headers: buildJsonHeaders(config, true),
+                    body: JSON.stringify({ task: draftIntent })
+                }
+                : { headers: buildJsonHeaders(config) }
+        );
 
-        if (!response.ok) {
-            throw new Error(await parseErrorMessage(response));
-        }
+        if (!response.ok) throw await parseMutationError(response);
 
         const payload = await response.json();
         const root = asRecord(payload);
@@ -664,6 +924,7 @@ export const apiClient = {
         const editable = asRecord(root.editable);
         const options = asRecord(root.options);
         const customFieldValuesRecord = asRecord(root.custom_field_values) ?? {};
+        const draftContractRaw = asRecord(root.draft_contract);
 
         if (!task || !editable || !options) throw new Error('Invalid response');
 
@@ -685,6 +946,21 @@ export const apiClient = {
         if (taskIdValue === undefined || subjectValue === undefined || statusIdValue === undefined || doneRatioValue === undefined || lockVersionValue === undefined) {
             throw new Error('Invalid response');
         }
+
+        const capabilityContextRaw = asRecord(root.capability_context);
+        const capabilityContext: EditMetaCapabilityContext = capabilityContextRaw
+            ? {
+                taskId: String(capabilityContextRaw.task_id ?? taskIdValue),
+                projectId: parseRequiredPositiveNumber(capabilityContextRaw.project_id, 'capability_context.project_id'),
+                trackerId: parseRequiredPositiveNumber(capabilityContextRaw.tracker_id, 'capability_context.tracker_id'),
+                statusId: parseRequiredPositiveNumber(capabilityContextRaw.status_id, 'capability_context.status_id')
+            }
+            : {
+                taskId: String(taskIdValue),
+                projectId: parseRequiredPositiveNumber(projectIdValue, 'project_id'),
+                trackerId: parseRequiredPositiveNumber(trackerIdValue, 'tracker_id'),
+                statusId: parseRequiredPositiveNumber(statusIdValue, 'status_id')
+            };
 
         const editableSubject = editable.subject;
         const editableAssignedToId = editable.assigned_to_id;
@@ -728,7 +1004,22 @@ export const apiClient = {
             else if (value === null) customFieldValues[key] = null;
         });
 
+        const draftContract: DraftContract | undefined = draftContractRaw
+            ? {
+                baseRevision: parseRequiredNonNegativeInteger(draftContractRaw.base_revision, 'draft_contract.base_revision'),
+                materialized: asRecord(draftContractRaw.materialized) ?? {},
+                normalizations: Array.isArray(draftContractRaw.normalizations)
+                    ? draftContractRaw.normalizations.filter((value): value is DraftContract['normalizations'][number] => Boolean(asRecord(value)))
+                    : [],
+                violations: Array.isArray(draftContractRaw.violations)
+                    ? draftContractRaw.violations.filter((value): value is DraftContract['violations'][number] => Boolean(asRecord(value)))
+                    : []
+            }
+            : undefined;
+
         return {
+            capabilityContext,
+            ...(draftContract ? { draftContract } : {}),
             task: {
                 id: String(taskIdValue),
                 subject: String(subjectValue),
@@ -776,74 +1067,89 @@ export const apiClient = {
         };
     },
 
-    updateTask: async (task: Task): Promise<UpdateTaskResult> => {
+    updateTask: async (task: Task, operationId?: string, fields?: Record<string, unknown>): Promise<UpdateTaskResult> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
 
-        const response = await fetch(`${getGlobalApiBase(config)}/tasks/${task.id}.json?${query}`, {
+        const requestedFields = fields ?? {
+            start_date: task.startDate,
+            due_date: task.dueDate,
+            parent_issue_id: task.parentId ? Number(task.parentId) : null
+        };
+        const taskPayload: Record<string, unknown> = { lock_version: task.lockVersion, ...requestedFields };
+        if (!fields) {
+            if (Object.prototype.hasOwnProperty.call(requestedFields, 'start_date')) taskPayload.start_date = formatDateOnly(task.startDate);
+            if (Object.prototype.hasOwnProperty.call(requestedFields, 'due_date')) taskPayload.due_date = formatDateOnly(task.dueDate);
+            if (Object.prototype.hasOwnProperty.call(requestedFields, 'parent_issue_id')) taskPayload.parent_issue_id = task.parentId ? Number(task.parentId) : null;
+        }
+
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/tasks/${task.id}.json?${query}`, {
             method: 'PATCH',
             headers: buildJsonHeaders(config, true),
             body: JSON.stringify({
-                task: {
-                    start_date: (task.startDate && Number.isFinite(task.startDate)) ? new Date(task.startDate).toISOString().split('T')[0] : null,
-                    due_date: (task.dueDate && Number.isFinite(task.dueDate)) ? new Date(task.dueDate).toISOString().split('T')[0] : null,
-                    parent_issue_id: task.parentId ? Number(task.parentId) : null,
-                    lock_version: task.lockVersion
-                }
+                task: taskPayload,
+                ...(operationId ? { client_operation_id: operationId } : {})
             })
         });
 
         if (response.status === 409) {
-            return { status: 'conflict', error: 'This task was updated by another user. Please reload.' };
+            return parseMutationTaskResult(response);
         }
 
         if (!response.ok) {
-            return { status: 'error', error: await parseErrorMessage(response) };
+            const error = await parseMutationError(response);
+            return { status: error.status, error: error.message, failure: error.failure };
         }
 
-        const data = await response.json();
-        return {
-            status: 'ok',
-            lockVersion: data.lock_version,
-            taskId: data.task_id ? String(data.task_id) : String(task.id),
-            parentId: data.parent_id ? String(data.parent_id) : undefined,
-            siblingPosition: data.sibling_position === 'tail' ? 'tail' : undefined
-        };
+        return parseMutationTaskResult(response);
     },
 
-    updateTaskFields: async (taskId: string, fields: Record<string, unknown>): Promise<UpdateTaskResult> => {
+    updateTaskFields: async (taskId: string, fields: Record<string, unknown>, operationId?: string): Promise<UpdateTaskResult> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
 
-        const response = await fetch(`${getGlobalApiBase(config)}/tasks/${taskId}.json?${query}`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/tasks/${taskId}.json?${query}`, {
             method: 'PATCH',
             headers: buildJsonHeaders(config, true),
-            body: JSON.stringify({ task: fields })
+            body: JSON.stringify({ task: fields, ...(operationId ? { client_operation_id: operationId } : {}) })
         });
 
         if (response.status === 409) {
-            return { status: 'conflict', error: 'This task was updated by another user. Please reload.' };
+            return parseMutationTaskResult(response);
         }
 
         if (!response.ok) {
-            return { status: 'error', error: await parseErrorMessage(response) };
+            const error = await parseMutationError(response);
+            return { status: error.status, error: error.message, failure: error.failure };
         }
 
-        const data = await response.json();
-        return {
-            status: 'ok',
-            lockVersion: data.lock_version,
-            taskId: data.task_id ? String(data.task_id) : String(taskId),
-            parentId: data.parent_id ? String(data.parent_id) : undefined,
-            siblingPosition: data.sibling_position === 'tail' ? 'tail' : undefined
-        };
+        return parseMutationTaskResult(response);
     },
 
-    createRelation: async (fromId: string, toId: string, type: string, delay?: number): Promise<Relation> => {
+    scheduleMutation: async (changes: ScheduleMutationChange[], operationId: string): Promise<ScheduleMutationResult> => {
+        const config = getConfig();
+        const query = buildViewContextQuery(config);
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/schedule_mutation.json?${query}`, {
+            method: 'POST',
+            headers: buildJsonHeaders(config, true),
+            body: JSON.stringify({
+                operation_id: operationId,
+                base_revisions: Object.fromEntries(changes.map(change => [change.taskId, change.baseRevision])),
+                changes: changes.map(({ taskId, startDate, dueDate }) => ({
+                    task_id: taskId,
+                    ...(startDate !== undefined ? { start_date: formatDateOnly(startDate) } : {}),
+                    ...(dueDate !== undefined ? { due_date: formatDateOnly(dueDate) } : {})
+                }))
+            })
+        });
+        return parseScheduleMutationResult(response);
+    },
+
+    createRelation: async (fromId: string, toId: string, type: string, delay?: number, operationId?: string): Promise<Relation & MutationMetadata & { status: 'ok' }> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
 
-        const response = await fetch(`${getGlobalApiBase(config)}/relations.json?${query}`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/relations.json?${query}`, {
             method: 'POST',
             headers: buildJsonHeaders(config, true),
             body: JSON.stringify({
@@ -852,13 +1158,13 @@ export const apiClient = {
                     issue_to_id: toId,
                     relation_type: type,
                     ...(typeof delay === 'number' ? { delay } : {})
-                }
+                },
+                ...(operationId ? { client_operation_id: operationId } : {})
             })
         });
 
         if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.error || response.statusText);
+            throw await parseMutationError(response);
         }
 
         const payload = await response.json();
@@ -870,62 +1176,78 @@ export const apiClient = {
             throw new Error('Invalid relation response');
         }
 
-        return relation;
+        return { status: 'ok', ...relation, ...parseMutationMetadata(payload) };
     },
 
-    updateRelation: async (relationId: string, type: string, delay?: number): Promise<Relation> => {
+    updateRelation: async (relationId: string, type: string, delay?: number, operationId?: string): Promise<Relation & MutationMetadata & { status: 'ok' }> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
-        const response = await fetch(`${getGlobalApiBase(config)}/relations/${relationId}.json?${query}`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/relations/${relationId}.json?${query}`, {
             method: 'PATCH',
             headers: buildJsonHeaders(config, true),
             body: JSON.stringify({
                 relation: {
                     relation_type: type,
                     ...(typeof delay === 'number' ? { delay } : {})
-                }
+                },
+                ...(operationId ? { client_operation_id: operationId } : {})
             })
         });
 
         if (!response.ok) {
-            throw new Error(await parseErrorMessage(response));
+            throw await parseMutationError(response);
         }
 
         const payload = await response.json();
-        return normalizeRelation(payload, { fromId: '', toId: '', type });
+        return { status: 'ok', ...normalizeRelation(payload, { fromId: '', toId: '', type }), ...parseMutationMetadata(payload) };
     },
 
-    deleteRelation: async (relationId: string): Promise<void> => {
+    deleteRelation: async (relationId: string, operationId?: string): Promise<MutationMetadata & { status: 'ok' }> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
 
-        const response = await fetch(`${getGlobalApiBase(config)}/relations/${relationId}.json?${query}`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/relations/${relationId}.json?${query}`, {
             method: 'DELETE',
-            headers: buildJsonHeaders(config, true)
+            headers: buildJsonHeaders(config, true),
+            ...(operationId ? { body: JSON.stringify({ client_operation_id: operationId }) } : {})
         });
 
         if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.error || response.statusText);
+            throw await parseMutationError(response);
         }
+        const payload = typeof response.json === 'function' ? await response.json().catch(() => ({})) : {};
+        return { status: 'ok', ...parseMutationMetadata(payload) };
     },
 
-    bulkCreateSubtasks: async (payload: { parentId: string; subjects: string[]; operationIssueIds?: string[] }): Promise<BulkCreateSubtasksResult> => {
+    getSubtaskTrackers: async (parentId: string, operationIssueIds: string[] = []): Promise<Array<{ id: number; name: string }>> => {
+        const config = getConfig();
+        const query = new URLSearchParams(buildViewContextQuery(config));
+        query.set('parent_issue_id', parentId);
+        operationIssueIds.forEach(id => query.append('operation_issue_ids[]', id));
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/subtasks/trackers.json?${query.toString()}`, {
+            headers: buildJsonHeaders(config)
+        });
+        if (!response.ok) throw await parseMutationError(response);
+        const payload = await response.json() as { trackers?: Array<{ id: number; name: string }> };
+        return Array.isArray(payload.trackers) ? payload.trackers : [];
+    },
+
+    bulkCreateSubtasks: async (payload: { parentId: string; subjects?: string[]; subtasks?: Array<{ subject: string; tracker_id?: number }>; operationIssueIds?: string[] }, operationId?: string): Promise<BulkCreateSubtasksResult> => {
         const config = getConfig();
         const query = buildViewContextQuery(config);
-        const response = await fetch(`${getGlobalApiBase(config)}/subtasks/bulk.json?${query}`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/subtasks/bulk.json?${query}`, {
             method: 'POST',
             headers: buildJsonHeaders(config, true),
             body: JSON.stringify({
                 parent_issue_id: Number(payload.parentId),
-                subjects: payload.subjects,
-                operation_issue_ids: (payload.operationIssueIds ?? []).map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0)
+                ...(payload.subtasks ? { subtasks: payload.subtasks } : { subjects: payload.subjects ?? [] }),
+                operation_issue_ids: (payload.operationIssueIds ?? []).map(id => Number(id)).filter(id => Number.isInteger(id) && id > 0),
+                ...(operationId ? { client_operation_id: operationId } : {})
             })
         });
 
         if (!response.ok) {
-            const err = await parseErrorMessage(response);
-            throw new Error(err);
+            throw await parseMutationError(response);
         }
 
         const data = await response.json();
@@ -945,25 +1267,27 @@ export const apiClient = {
 
         return {
             status: 'ok',
+            ...parseMutationMetadata(data),
             successCount: typeof data.success_count === 'number' ? data.success_count : 0,
             failCount: typeof data.fail_count === 'number' ? data.fail_count : 0,
             results
         };
     },
 
-    deleteTask: async (taskId: string): Promise<void> => {
+    deleteTask: async (taskId: string, operationId?: string): Promise<MutationMetadata & { status: 'ok' }> => {
         const config = getConfig();
+        const query = buildViewContextQuery(config);
 
-        const redmineBase = config.redmineBase || '';
-        // Redmine API DELETE /issues/:id.json
-        const response = await fetch(`${redmineBase}/issues/${taskId}.json`, {
+        const response = await sessionFetch(`${getGlobalApiBase(config)}/tasks/${taskId}.json?${query}`, {
             method: 'DELETE',
-            headers: buildJsonHeaders(config, true)
+            headers: buildJsonHeaders(config, true),
+            ...(operationId ? { body: JSON.stringify({ client_operation_id: operationId }) } : {})
         });
 
         if (!response.ok) {
-            const err = await parseErrorMessage(response);
-            throw new Error(err);
+            throw await parseMutationError(response);
         }
+        const payload = typeof response.json === 'function' ? await response.json().catch(() => ({})) : {};
+        return { status: 'ok', ...parseMutationMetadata(payload) };
     }
 };

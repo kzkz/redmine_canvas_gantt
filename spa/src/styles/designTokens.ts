@@ -1,22 +1,18 @@
 import { resolveIsDark } from '../utils/colorScheme';
 
 export const fontFamilies = {
-    ui: '"DM Sans", "Noto Sans JP", "Helvetica Neue", Helvetica, Arial, sans-serif',
-    display: '"Outfit", "Helvetica Neue", Helvetica, Arial, sans-serif',
-    mid: '"Poppins", "Helvetica Neue", Helvetica, Arial, sans-serif',
-    data: '"Roboto", "Helvetica Neue", Helvetica, Arial, sans-serif',
+    ui: '"DM Sans Variable", "Noto Sans JP Variable", "Helvetica Neue", Helvetica, Arial, sans-serif',
     mono: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace'
 } as const;
 
 export const canvasFonts = {
     body: `500 12px ${fontFamilies.ui}`,
-    bodyStrong: `600 11px ${fontFamilies.data}`,
-    header: `600 11px ${fontFamilies.data}`
+    bodyStrong: `600 11px ${fontFamilies.ui}`,
+    header: `600 11px ${fontFamilies.ui}`
 } as const;
-
 // Light palette (default). Canvas drawing and inline-styled components read
 // from `designTokens`, which is resolved once at module load to either this or
-// the dark palette based on the OS/browser color-scheme preference.
+// the dark palette based on the resolved color scheme.
 const lightTokens = {
     appBg: '#ffffff',
     surfaceSubtle: '#f7f9fc',
@@ -54,6 +50,10 @@ const lightTokens = {
     sidebarDropTargetBg: '#e6f4ea',
     sidebarDropTargetBorder: '#34a853',
     sidebarSelectedRowBg: '#e8f0fe',
+    buttonPrimaryBg: '#181e25',
+    buttonPrimaryFg: '#ffffff',
+    buttonSecondaryBg: '#f0f0f0',
+    buttonSecondaryFg: '#45515e',
     tooltipBg: '#333333',
     tooltipFg: '#ffffff',
     tooltipShadow: '0 2px 8px rgba(0,0,0,0.2)',
@@ -161,6 +161,10 @@ const darkTokens: DesignTokens = {
     sidebarDropTargetBg: '#1f3326',
     sidebarDropTargetBorder: '#34a853',
     sidebarSelectedRowBg: '#243447',
+    buttonPrimaryBg: '#4d8bff',
+    buttonPrimaryFg: '#ffffff',
+    buttonSecondaryBg: '#2a2f35',
+    buttonSecondaryFg: '#b0b6bd',
     tooltipBg: '#3a3f45',
     tooltipFg: '#f0f0f0',
     tooltipShadow: '0 2px 8px rgba(0,0,0,0.6)',

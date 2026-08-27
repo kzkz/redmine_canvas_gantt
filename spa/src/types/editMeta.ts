@@ -31,7 +31,36 @@ export interface CustomFieldMeta {
     possibleValues?: string[] | null;
 }
 
+export interface EditMetaCapabilityContext {
+    taskId: string;
+    projectId: number;
+    trackerId: number;
+    statusId: number;
+}
+
+export interface DraftContractNormalization {
+    field: string;
+    from?: unknown;
+    to?: unknown;
+    source: 'redmine' | 'policy';
+}
+
+export interface DraftContractViolation {
+    field?: string;
+    code: string;
+    message: string;
+}
+
+export interface DraftContract {
+    baseRevision: number;
+    materialized: Record<string, unknown>;
+    normalizations: DraftContractNormalization[];
+    violations: DraftContractViolation[];
+}
+
 export interface TaskEditMeta {
+    capabilityContext?: EditMetaCapabilityContext;
+    draftContract?: DraftContract;
     task: {
         id: string;
         subject: string;

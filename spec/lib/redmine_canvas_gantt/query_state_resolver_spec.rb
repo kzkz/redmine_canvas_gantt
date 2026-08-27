@@ -1,6 +1,13 @@
 require_relative '../../spec_helper'
+require_relative '../../../lib/redmine_canvas_gantt/data_payload_budget'
 
 RSpec.describe RedmineCanvasGantt::QueryStateResolver do
+  def saved_query_scope(issue_ids)
+    scope = double('SavedQueryScope')
+    allow(scope).to receive(:select).with(:id).and_return(issue_ids)
+    scope
+  end
+
   let(:project) { instance_double(Project, id: 1) }
   let(:current_user) { instance_double(User, id: 5) }
   let(:issue_scope) { double('IssueScope') }
@@ -39,7 +46,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       },
       sort_criteria: [['subject', 'desc']],
       group_by: 'assigned_to',
-      issue_ids: [12, 10]
+      base_scope: saved_query_scope([12, 10])
     )
   end
 
@@ -162,6 +169,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       selected_assignee_ids: [7, nil],
       selected_project_ids: ['1', '2'],
       selected_version_ids: ['11'],
+      selected_tracker_ids: [3],
       member_projects_only: false,
       show_subprojects: true,
       sort_config: { key: 'startDate', direction: 'desc' },
@@ -174,10 +182,118 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
         status: { mode: 'subset', values: [1, 2] },
         assignee: { mode: 'subset', values: [7, nil] },
         project: { mode: 'subset', values: ['9'] },
-        version: { mode: 'subset', values: ['11'] }
+        version: { mode: 'subset', values: ['11'] },
+        tracker: { mode: 'subset', values: [3] }
       }
     )
-    expect(result[:warnings]).to include('Ignored unsupported field tracker_id')
+    expect(result[:warnings]).not_to include('Ignored unsupported field tracker_id')
+  end
+
+  it 'applies tracker all standard filter without adding a tracker scope' do
+    params = ActionController::Parameters.new(
+      set_filter: '1',
+      f: ['tracker_id'],
+      op: { 'tracker_id' => '*' }
+    )
+
+    resolver = described_class.new(
+      project: project,
+      params: params,
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes
+    )
+
+    result = resolver.resolve(project_ids: [1, 2])
+
+    expect(result[:initial_state][:selected_tracker_ids]).to eq([])
+    expect(result[:query_context][:explicit_overrides]).to include(tracker: { mode: 'all' })
+  end
+
+  it 'preserves an unsupported saved-query tracker operator' do
+    query = instance_double(
+      IssueQuery,
+      id: 103,
+      visible?: true,
+      filters: { 'tracker_id' => { operator: '!', values: ['3'] } },
+      sort_criteria: nil,
+      group_by: nil
+    )
+    working_query = instance_double(
+      IssueQuery,
+      filters: query.filters,
+      sort_criteria: nil,
+      group_by: nil,
+      base_scope: saved_query_scope([31])
+    )
+
+    allow(IssueQuery).to receive(:find_by).with(id: '103').and_return(query)
+    allow(query).to receive(:dup).and_return(working_query)
+    expect(working_query).to receive(:filters=).with(query.filters)
+    allow(working_query).to receive(:column_names).and_return([])
+
+    result = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new(query_id: '103'),
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes
+    ).resolve(project_ids: [1, 2])
+
+    expect(result[:initial_state][:selected_tracker_ids]).to eq([])
+    expect(result[:query_context][:explicit_overrides]).not_to have_key(:tracker)
+  end
+
+  it 'inherits tracker selections from a saved query' do
+    query = instance_double(
+      IssueQuery,
+      id: 104,
+      visible?: true,
+      filters: { 'tracker_id' => { operator: '=', values: %w[3 4] } },
+      sort_criteria: nil,
+      group_by: nil
+    )
+    working_query = instance_double(
+      IssueQuery,
+      filters: query.filters,
+      sort_criteria: nil,
+      group_by: nil,
+      base_scope: saved_query_scope([32, 33])
+    )
+
+    allow(IssueQuery).to receive(:find_by).with(id: '104').and_return(query)
+    allow(query).to receive(:dup).and_return(working_query)
+    allow(working_query).to receive(:filters=)
+    allow(working_query).to receive(:column_names).and_return([])
+
+    result = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new(query_id: '104'),
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes
+    ).resolve(project_ids: [1, 2])
+
+    expect(result[:initial_state][:selected_tracker_ids]).to eq([3, 4])
+    expect(result[:query_context][:explicit_overrides]).to eq({})
+  end
+
+  it 'filters issues at the database scope for a Canvas tracker selection' do
+    filtered_scope = double('FilteredScope')
+    expect(issue_scope).to receive(:where).with(project_id: [1, 2]).and_return(issue_scope)
+    expect(issue_scope).to receive(:where).with(tracker_id: [3, 4]).and_return(filtered_scope)
+    allow(filtered_scope).to receive(:includes).with(*issue_includes).and_return(filtered_scope)
+    allow(filtered_scope).to receive(:to_a).and_return([])
+
+    result = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new(tracker_ids: ['3', '4']),
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes
+    ).resolve(project_ids: [1, 2])
+
+    expect(result[:initial_state][:selected_tracker_ids]).to eq([3, 4])
   end
 
   it 'keeps standard subproject filters in the Redmine query without changing Canvas state' do
@@ -196,7 +312,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       filters: {},
       sort_criteria: nil,
       group_by: nil,
-      issue_ids: [23]
+      base_scope: saved_query_scope([23])
     )
 
     allow(IssueQuery).to receive(:find_by).with(id: '102').and_return(query)
@@ -279,7 +395,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       },
       sort_criteria: nil,
       group_by: nil,
-      issue_ids: []
+      base_scope: saved_query_scope([])
     )
 
     allow(IssueQuery).to receive(:find_by).with(id: '99').and_return(query)
@@ -317,7 +433,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       filters: query.filters,
       sort_criteria: nil,
       group_by: nil,
-      issue_ids: [22]
+      base_scope: saved_query_scope([22])
     )
 
     allow(IssueQuery).to receive(:find_by).with(id: '101').and_return(query)
@@ -365,7 +481,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       },
       sort_criteria: nil,
       group_by: nil,
-      issue_ids: []
+      base_scope: saved_query_scope([])
     )
 
     allow(IssueQuery).to receive(:find_by).with(id: '100').and_return(query)
@@ -468,7 +584,7 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
       },
       sort_criteria: nil,
       group_by: nil,
-      issue_ids: [12]
+      base_scope: saved_query_scope([12])
     )
     filtered_scope = double('FilteredScope')
 
@@ -582,5 +698,81 @@ RSpec.describe RedmineCanvasGantt::QueryStateResolver do
     expect(result[:initial_state]).to include(
       member_projects_only: true
     )
+  end
+
+  it 'uses the data budget before materializing the resolved issue scope' do
+    budget = instance_double(RedmineCanvasGantt::DataPayloadBudget, issue_limit: 10_000)
+    resolver = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new,
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes,
+      data_payload_budget: budget
+    )
+    allow(resolver).to receive(:issues_scope_for).and_return(issue_scope)
+    expect(budget).to receive(:load_records)
+      .with(issue_scope, resource: 'issues', limit: 10_000)
+      .and_return([])
+
+    issues = resolver.send(
+      :load_issues,
+      query_issue_scope: nil,
+      project_ids: [1],
+      selected_project_ids: [],
+      state: { sort_config: nil }
+    )
+
+    expect(issues).to eq([])
+  end
+
+  it 'composes a saved query as a database subquery before the bounded final materialization' do
+    query_scope = double('SavedQueryScopeWith20kCandidates')
+    query_id_subquery = double('SavedQueryIdSubqueryWith20kCandidates')
+    final_issues = Array.new(100) do |index|
+      double("FinalIssue#{index}", id: index + 1, subject: "Issue #{index}")
+    end
+    budget = instance_double(RedmineCanvasGantt::DataPayloadBudget, issue_limit: 10_000)
+
+    expect(working_query).not_to receive(:issue_ids)
+    expect(working_query).to receive(:base_scope).and_return(query_scope)
+    expect(query_scope).to receive(:select).with(:id).and_return(query_id_subquery)
+    expect(issue_scope).to receive(:where).with(project_id: [1, 2]).and_return(issue_scope)
+    expect(issue_scope).to receive(:where).with(id: query_id_subquery).and_return(issue_scope)
+    expect(budget).to receive(:load_records)
+      .with(issue_scope, resource: 'issues', limit: 10_000)
+      .and_return(final_issues)
+
+    result = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new(query_id: '42', tracker_ids: ['3']),
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes,
+      data_payload_budget: budget
+    ).resolve(project_ids: [1, 2])
+
+    expect(result[:issues]).to eq(final_issues)
+  end
+
+  it 'propagates final selection budget overflow without falling back to a broader query-less scope' do
+    budget = instance_double(RedmineCanvasGantt::DataPayloadBudget, issue_limit: 3)
+    overflow = RedmineCanvasGantt::DataPayloadBudget::Exceeded.new(
+      resource: 'issues',
+      limit: 3,
+      actual: 4
+    )
+    expect(budget).to receive(:load_records).and_raise(overflow)
+
+    resolver = described_class.new(
+      project: project,
+      params: ActionController::Parameters.new(query_id: '42'),
+      current_user: current_user,
+      issue_scope: issue_scope,
+      issue_includes: issue_includes,
+      data_payload_budget: budget
+    )
+
+    expect { resolver.resolve(project_ids: [1, 2]) }.to raise_error(overflow)
   end
 end

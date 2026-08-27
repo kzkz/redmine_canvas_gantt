@@ -1,6 +1,8 @@
 require 'set'
 
 class CanvasGanttsController < ApplicationController
+  BUSINESS_CALENDAR_REVISION_HEADER = 'HTTP_X_REDMINE_CANVAS_GANTT_CALENDAR_REVISION'.freeze
+
   CANVAS_GANTT_UI_SETTINGS = {
     'inline_edit_subject' => '1',
     'inline_edit_assigned_to' => '1',
@@ -55,6 +57,7 @@ class CanvasGanttsController < ApplicationController
     label_toggle_sidebar: :label_toggle_sidebar,
     label_maximize_left_pane: :label_maximize_left_pane,
     label_maximize_right_pane: :label_maximize_right_pane,
+    label_standard_view: :label_standard_view,
     label_restore_split_view: :label_restore_split_view,
     label_month: :label_month,
     label_week: :label_week,
@@ -71,6 +74,7 @@ class CanvasGanttsController < ApplicationController
     label_include_closed_issues: :label_include_closed_issues,
     label_today_onward_only: :label_today_onward_only,
     label_saved_queries: :label_saved_queries,
+    label_query: :label_query,
     label_loading_saved_queries: :label_loading_saved_queries,
     label_saved_query_load_failed: :label_saved_query_load_failed,
     label_no_saved_queries: :label_no_saved_queries,
@@ -118,6 +122,9 @@ class CanvasGanttsController < ApplicationController
     label_invalid_format: :label_invalid_format,
     label_search: :label_search,
     label_failed_to_save: :label_failed_to_save,
+    label_unresolved_task_conflict: :label_unresolved_task_conflict,
+    label_unresolved_non_bulk_mutation: :label_unresolved_non_bulk_mutation,
+    label_no_bulk_supported_mutation_fields: :label_no_bulk_supported_mutation_fields,
     label_yes: :general_text_yes,
     label_no: :general_text_no,
     button_expand_all: :button_expand_all,
@@ -149,6 +156,7 @@ class CanvasGanttsController < ApplicationController
     label_font_size_medium: :label_font_size_medium,
     label_font_size_large: :label_font_size_large,
     label_display_settings: :label_display_settings,
+    label_settings: :label_settings,
     label_share_display_settings_across_projects: :label_share_display_settings_across_projects,
     label_display_settings_source: :label_display_settings_source,
     label_display_settings_source_project: :label_display_settings_source_project,
@@ -165,13 +173,19 @@ class CanvasGanttsController < ApplicationController
     label_version_short: :label_version_short,
     label_status_short: :label_status_short,
     label_progress_short: :label_progress_short,
+    label_display_short: :label_display_short,
     label_column_short: :label_column_short,
     label_dependencies_short: :label_dependencies_short,
+    label_query_short: :label_query_short,
+    label_workload_short: :label_workload_short,
+    label_chart_short: :label_chart_short,
     label_refresh_failed: :label_refresh_failed,
     label_project_candidates_load_failed: :label_project_candidates_load_failed,
     label_member_projects_only: :label_member_projects_only,
     label_selected_projects_outside_candidates: :label_selected_projects_outside_candidates,
+    label_selected_trackers_outside_candidates: :label_selected_trackers_outside_candidates,
     label_relation_add_failed: :label_relation_add_failed,
+    error_canvas_gantt_business_calendar_invalid: :error_canvas_gantt_business_calendar_invalid,
     label_dependency_edit_mode: :label_dependency_edit_mode,
     label_relation_type_precedes_info: :label_relation_type_precedes_info,
     label_relation_type_relates_info: :label_relation_type_relates_info,
@@ -187,6 +201,8 @@ class CanvasGanttsController < ApplicationController
     label_auto_schedule_move_mode_off: :label_auto_schedule_move_mode_off,
     label_auto_schedule_move_mode_constraint_push: :label_auto_schedule_move_mode_constraint_push,
     label_auto_schedule_move_mode_linked_shift: :label_auto_schedule_move_mode_linked_shift,
+    label_auto_schedule_external_conflict: :label_auto_schedule_external_conflict,
+    label_auto_schedule_permission_denied: :label_auto_schedule_permission_denied,
     label_relation_delay_auto_calc_unavailable: :label_relation_delay_auto_calc_unavailable,
     label_relation_delay_invalid: :label_relation_delay_invalid,
     label_relation_delay_required: :label_relation_delay_required,
@@ -203,6 +219,8 @@ class CanvasGanttsController < ApplicationController
     label_show_versions: :label_show_versions,
     label_none: :label_none,
     label_toggle_points_orphans: :label_toggle_points_orphans,
+    label_show_start_date_only: :label_show_start_date_only,
+    label_show_due_date_only: :label_show_due_date_only,
     label_toggle_task_titles: :label_toggle_task_titles,
     label_toggle_hierarchy_lines: :label_toggle_hierarchy_lines,
     label_points_short: :label_points_short,
@@ -213,9 +231,19 @@ class CanvasGanttsController < ApplicationController
     label_parent_drop_forbidden: :label_parent_drop_forbidden,
     label_parent_drop_conflict: :label_parent_drop_conflict,
     label_parent_drop_failed: :label_parent_drop_failed,
+    label_conflict_resolution: :label_conflict_resolution,
+    button_use_remote: :button_use_remote,
+    button_keep_local_retry: :button_keep_local_retry,
     label_issue: :label_issue,
     label_new: :label_new,
     label_bulk_subtask_creation: :label_bulk_subtask_creation,
+    label_bulk_subtask_mode: :label_bulk_subtask_mode,
+    label_bulk_subtask_table_mode: :label_bulk_subtask_table_mode,
+    label_bulk_subtask_text_mode: :label_bulk_subtask_text_mode,
+    label_bulk_subtask_subject: :label_bulk_subtask_subject,
+    label_bulk_subtask_add_row: :label_bulk_subtask_add_row,
+    label_bulk_subtask_delete_row: :label_bulk_subtask_delete_row,
+    label_default: :label_default,
     placeholder_bulk_subtask_creation: :placeholder_bulk_subtask_creation,
     label_bulk_subtask_creation_success: :label_bulk_subtask_creation_success,
     label_bulk_subtask_creation_partial_fail: :label_bulk_subtask_creation_partial_fail,
@@ -249,6 +277,8 @@ class CanvasGanttsController < ApplicationController
     label_help_toolbar_icons: :label_help_toolbar_icons,
     help_desc_edit_query: :help_desc_edit_query,
     help_desc_saved_queries: :help_desc_saved_queries,
+    help_desc_chart_display: :help_desc_chart_display,
+  help_desc_settings: :help_desc_settings,
     help_desc_display_settings: :help_desc_display_settings,
     help_desc_baseline: :help_desc_baseline,
     help_desc_workload: :help_desc_workload,
@@ -259,6 +289,7 @@ class CanvasGanttsController < ApplicationController
     help_desc_columns: :help_desc_columns,
     help_desc_assignee_filter: :help_desc_assignee_filter,
     help_desc_project_filter: :help_desc_project_filter,
+    help_desc_tracker_filter: :help_desc_tracker_filter,
     help_desc_version_filter: :help_desc_version_filter,
     help_desc_status_filter: :help_desc_status_filter,
     help_desc_task_bar_dates: :help_desc_task_bar_dates,
@@ -301,13 +332,14 @@ class CanvasGanttsController < ApplicationController
     :relations_to, :relations_from, :status, :tracker, :assigned_to, :priority,
     :author, :category, :project, :fixed_version, { custom_values: :custom_field }
   ].freeze
+  DATA_ISSUE_INCLUDES = (ISSUE_INCLUDES - %i[relations_to relations_from]).freeze
   EDITABLE_FIELDS = %i[
     subject assigned_to_id status_id done_ratio due_date start_date priority_id
     category_id estimated_hours project_id tracker_id fixed_version_id custom_field_values
   ].freeze
   TASK_PERMITTED_ATTRIBUTES = %i[
     start_date due_date lock_version subject assigned_to_id status_id done_ratio priority_id
-    author_id category_id estimated_hours project_id tracker_id fixed_version_id parent_issue_id
+    category_id estimated_hours project_id tracker_id fixed_version_id parent_issue_id
   ].freeze
   CUSTOM_FIELD_FORMATS = %w[string int float list bool date text].freeze
   EDITABLE_RELATION_TYPES = %w[precedes follows blocks blocked relates].freeze
@@ -318,9 +350,11 @@ class CanvasGanttsController < ApplicationController
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'custom_field_serializer').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'custom_field_extractor').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'data_payload_builder').to_s
+  require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'data_payload_budget').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'constraint_graph').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'relation_params_normalizer').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'edit_meta_payload_builder').to_s
+  require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'issue_draft_evaluator').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'relation_change_validator').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'bulk_subtask_creator').to_s
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'parent_issue_resolver').to_s
@@ -331,13 +365,18 @@ class CanvasGanttsController < ApplicationController
   require_dependency Rails.root.join('plugins', 'redmine_canvas_gantt', 'lib', 'redmine_canvas_gantt', 'baseline_repository').to_s
 
   helper RedmineCanvasGantt::ViteAssetHelper
-  accept_api_auth :data, :queries, :edit_meta, :update, :bulk_create_subtasks, :create_relation, :update_relation, :destroy_relation, :save_baseline
+  accept_api_auth :data, :queries, :edit_meta, :edit_meta_preview, :update, :destroy_task, :bulk_create_subtasks, :create_relation, :update_relation, :destroy_relation, :save_baseline
 
   before_action :resolve_canvas_project
   before_action :set_permissions
-  before_action :ensure_view_permission, only: [:index, :data, :queries, :edit_meta]
+  # Every Canvas Gantt endpoint, including JSON mutation endpoints, is part of
+  # the feature gated by this permission. Individual Issue operations perform
+  # their own standard Redmine authorization below.
+  before_action :ensure_view_permission
+  before_action :ensure_business_calendar_revision,
+                if: :business_calendar_revision_required?
   skip_forgery_protection only: [:asset]
-  skip_before_action :resolve_canvas_project, :set_permissions, only: [:asset]
+  skip_before_action :resolve_canvas_project, :set_permissions, :ensure_view_permission, only: [:asset]
 
   # GET /plugin_assets/redmine_canvas_gantt/build/*asset_path
   # Fallback asset delivery when public/plugin_assets static serving is disabled.
@@ -366,20 +405,33 @@ class CanvasGanttsController < ApplicationController
       baseline_load = baseline_repository.load(project_id: @project.id)
       member_projects_only = resolved_query[:initial_state].fetch(:member_projects_only, false)
 
-      render json: data_payload_builder.build(
+      relations = data_relations(resolved_query[:issues])
+      payload = data_payload_builder.build(
         project: @project,
         permissions: @permissions,
         project_ids: project_ids,
         issues: resolved_query[:issues],
-        filter_option_projects: filter_option_projects(project_ids, member_projects_only: member_projects_only),
+        relations: relations,
+        filter_option_projects: bounded_data_collection(
+          filter_option_projects(project_ids, member_projects_only: member_projects_only),
+          resource: 'projects'
+        ),
         filter_option_issues: filter_option_issues(project_ids),
+        filter_option_trackers: bounded_data_collection(
+          filter_option_trackers(project_ids),
+          resource: 'trackers'
+        ),
         initial_state: resolved_query[:initial_state],
         query_context: resolved_query[:query_context],
         warnings: resolved_query[:warnings] + baseline_load.warnings,
-        baseline: baseline_load.snapshot
+        baseline: visible_baseline_snapshot(baseline_load.snapshot, project_ids),
+        business_calendar: business_calendar_resolver.payload(projects: business_calendar_projects(project_ids))
       )
+      render body: data_payload_budget.encode_json(payload), content_type: 'application/json'
+    rescue RedmineCanvasGantt::DataPayloadBudget::Exceeded => e
+      render_data_payload_limit(e)
     rescue => e
-      render json: { error: e.message }, status: :internal_server_error
+      render_internal_error(e)
     end
   end
 
@@ -398,7 +450,7 @@ class CanvasGanttsController < ApplicationController
       end
     }
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
   end
 
   # POST /projects/:project_id/canvas_gantt/baseline.json
@@ -418,44 +470,34 @@ class CanvasGanttsController < ApplicationController
     )
     saved_snapshot = baseline_repository.replace(project_id: @project.id, snapshot: baseline_snapshot)
 
-    render json: {
-      status: 'ok',
+    render json: mutation_response(status: 'ok', completeness: 'complete').merge(
       baseline: saved_snapshot.to_payload_hash,
       warnings: warnings
-    }
+    )
   rescue ArgumentError => e
     render json: { error: e.message }, status: :unprocessable_entity
+  rescue RedmineCanvasGantt::DataPayloadBudget::Exceeded => e
+    render_data_payload_limit(e)
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
   end
 
   # GET /projects/:project_id/canvas_gantt/tasks/:id/edit_meta.json
   def edit_meta
-    issue = Issue.visible.find(params[:id])
-    return unless ensure_issue_in_scope(issue)
-
-    editable = User.current.allowed_to?(:edit_issues, issue.project) && issue.editable?
-    field_editable = build_field_editable(issue, editable)
-    custom_fields, custom_field_values = custom_field_extractor.extract_custom_fields(
-      issue,
-      inline_custom_fields_enabled? && field_editable[:custom_field_values]
-    )
-    options_project = edit_meta_options_project(issue)
-    return unless options_project
-
-    render json: edit_meta_payload_builder.build(
-      issue: issue,
-      editable: field_editable,
-      custom_fields: custom_fields,
-      custom_field_values: custom_field_values,
-      permissions: @permissions,
-      project_scope_ids: current_view_scope[:scope_project_ids],
-      options_project: options_project
-    )
+    render_edit_meta(intent: legacy_edit_meta_intent)
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_task_not_found) }, status: :not_found
+    render_edit_meta_not_found
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
+  end
+
+  # POST /projects/:project_id/canvas_gantt/tasks/:id/edit_meta/preview.json
+  def edit_meta_preview
+    render_edit_meta(intent: draft_task_intent, require_editable: true)
+  rescue ActiveRecord::RecordNotFound
+    render_edit_meta_not_found
+  rescue => e
+    render_internal_error(e)
   end
 
   # PATCH /projects/:project_id/canvas_gantt/tasks/:id.json
@@ -463,14 +505,20 @@ class CanvasGanttsController < ApplicationController
     issue = Issue.visible.find(params[:id])
     return unless ensure_issue_in_scope(issue)
     return unless ensure_issue_editable(issue)
-    parent_issue = load_parent_issue(issue, params.dig(:task, :parent_issue_id))
-    return unless parent_issue != :invalid
+    previous_parent_id = issue.parent_id
 
-    # Optimistic Locking Check handled by ActiveRecord automatically if lock_version is present
-    issue.init_journal(User.current)
-    original_values = original_project_move_values(issue)
-    issue.safe_attributes = permitted_task_params
-    return unless ensure_project_move_valid!(issue, original_values)
+    task_attributes = permitted_task_params
+    intent = draft_task_intent.merge(task_attributes.to_h.symbolize_keys)
+    if stale_draft_revision?(issue, intent)
+      render_stale_revision_conflict(issue)
+      return
+    end
+    intent = preprocess_draft_intent(issue, intent)
+    return if performed?
+    evaluation = issue_draft_evaluator.evaluate(issue: issue, intent: intent)
+    unless evaluation.valid?
+      return render_draft_evaluation_failure(evaluation, issue)
+    end
 
     if issue.save
       if requested_parent_issue_id_provided? && issue.parent_id != requested_parent_issue_id
@@ -478,42 +526,148 @@ class CanvasGanttsController < ApplicationController
         return
       end
 
-      render json: {
+      render json: mutation_response(
         status: 'ok',
+        completeness: 'partial',
+        entity: data_payload_builder.build_task_state(issue),
+        revision: issue.lock_version,
+        invalidated_entity_ids: [issue.id, previous_parent_id, issue.parent_id]
+      ).merge(
         lock_version: issue.lock_version,
         task_id: issue.id,
         parent_id: issue.parent_id,
         sibling_position: 'tail'
-      }
+      )
     else
       render json: { errors: issue.errors.full_messages }, status: :unprocessable_entity
     end
   rescue ActiveRecord::StaleObjectError
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_conflict_reload) }, status: :conflict
+    remote_issue = Issue.visible.find_by(id: params[:id])
+    render json: mutation_response(
+      status: 'conflict',
+      completeness: 'partial',
+      entity: remote_issue && data_payload_builder.build_task_state(remote_issue),
+      revision: remote_issue&.lock_version
+    ).merge(error: canvas_gantt_l(:error_canvas_gantt_conflict_reload)), status: :conflict
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_task_not_found) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_task_not_found),
+      kind: 'not_found',
+      resource_role: 'target',
+      resource_type: 'task',
+      resource_id: params[:id]
+    ), status: :not_found
+  end
+
+  # POST /projects/:project_id/canvas_gantt/schedule_mutation.json
+  def schedule_mutation
+    operation_id = params[:operation_id].to_s
+    if operation_id.blank?
+      render json: { error: 'operation_id is required' }, status: :unprocessable_entity
+      return
+    end
+
+    result = schedule_mutation_coordinator.call(
+      operation_id: operation_id,
+      base_revisions: params[:base_revisions] || {},
+      changes: params[:changes] || []
+    )
+    response = {
+      status: result.status.to_s,
+      operation_id: operation_id,
+      completeness: result.status == :ok ? 'complete' : 'partial',
+      entities: result.entities,
+      revisions: result.revisions,
+      invalidated_entity_ids: result.invalidated_entity_ids,
+      **(result.errors.present? ? { errors: result.errors } : {}),
+      **(result.conflict ? { conflict: result.conflict } : {}),
+      **(result.failure ? { failure: result.failure } : {})
+    }
+    render json: response, status: {
+      ok: :ok,
+      conflict: :conflict,
+      validation_error: :unprocessable_entity,
+      forbidden: :forbidden,
+      not_found: :not_found
+    }.fetch(result.status, :internal_server_error)
+  rescue ActionController::ParameterMissing, ArgumentError => error
+    render json: { status: 'validation_error', error: error.message }, status: :unprocessable_entity
+  rescue => error
+    render_internal_error(error)
+  end
+
+  # DELETE /canvas_gantt/tasks/:id.json
+  def destroy_task
+    issue = Issue.visible.find(params[:id])
+    return unless ensure_issue_in_scope(issue)
+    return unless ensure_issue_deletable(issue)
+
+    parent_id = issue.parent_id
+    issue.destroy
+    render json: mutation_response(
+      status: 'ok',
+      completeness: 'partial',
+      invalidated_entity_ids: [issue.id, parent_id],
+      deleted_entity_ids: [issue.id]
+    )
+  rescue ActiveRecord::RecordNotFound
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_task_not_found),
+      kind: 'not_found',
+      resource_role: 'target',
+      resource_type: 'task',
+      resource_id: params[:id]
+    ), status: :not_found
   end
 
   # POST /projects/:project_id/canvas_gantt/subtasks/bulk.json
   def bulk_create_subtasks
     parent_issue = Issue.visible.find(params[:parent_issue_id])
-    return unless ensure_issue_in_scope(parent_issue)
-    return unless ensure_issue_in_operation_scope(parent_issue)
+    return unless ensure_issue_in_scope(parent_issue, resource_role: 'reference', resource_type: 'parent_task')
+    return unless ensure_issue_in_operation_scope(parent_issue, resource_role: 'reference', resource_type: 'parent_task')
 
     unless bulk_subtask_creator.allowed?(parent_issue)
       render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
       return
     end
 
+    subtasks = params[:subtasks]
     subjects = Array(params[:subjects])
-    if subjects.empty?
+    if subtasks.blank? && subjects.empty?
       render json: { error: canvas_gantt_l(:error_canvas_gantt_subjects_non_empty_array) }, status: :unprocessable_entity
       return
     end
 
-    render json: bulk_subtask_creator.call(parent_issue: parent_issue, subjects: subjects)
+    result = bulk_subtask_creator.call(parent_issue: parent_issue, subjects: subjects, subtasks: subtasks)
+    created_ids = Array(result[:results] || result['results']).filter_map do |entry|
+      entry[:issue_id] || entry['issue_id'] if entry.respond_to?(:[])
+    end
+    render json: mutation_response(status: 'ok', completeness: 'partial', invalidated_entity_ids: [parent_issue.id] + created_ids).merge(result)
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_parent_task_not_found) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_parent_task_not_found),
+      kind: 'not_found',
+      resource_role: 'reference',
+      resource_type: 'parent_task'
+    ), status: :not_found
+  end
+
+  # GET /projects/:project_id/canvas_gantt/subtasks/trackers.json
+  def subtask_trackers
+    parent_issue = Issue.visible.find(params[:parent_issue_id])
+    return unless ensure_issue_in_scope(parent_issue, resource_role: 'reference', resource_type: 'parent_task')
+    return unless ensure_issue_in_operation_scope(parent_issue, resource_role: 'reference', resource_type: 'parent_task')
+
+    render json: {
+      trackers: parent_issue.project.trackers.map { |tracker| { id: tracker.id, name: tracker.name } }
+    }
+  rescue ActiveRecord::RecordNotFound
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_parent_task_not_found),
+      kind: 'not_found',
+      resource_role: 'reference',
+      resource_type: 'parent_task'
+    ), status: :not_found
   end
 
   # POST /projects/:project_id/canvas_gantt/relations.json
@@ -534,43 +688,82 @@ class CanvasGanttsController < ApplicationController
       relation_id: '__pending__'
     )
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_task_not_found) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_task_not_found),
+      kind: 'not_found',
+      resource_role: 'relation',
+      resource_type: 'relation'
+    ), status: :not_found
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
   end
 
   # PATCH /projects/:project_id/canvas_gantt/relations/:id.json
   def update_relation
     relation = IssueRelation.find(params[:id])
     return unless ensure_relation_editable!(relation)
+    issue_from, issue_to = @authorized_relation_endpoints
 
     save_relation_change(
       relation: relation,
-      issue_from: relation.issue_from,
-      issue_to: relation.issue_to,
+      issue_from: issue_from,
+      issue_to: issue_to,
       relation_id: relation.id,
       replacing_relation_id: relation.id
     )
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_relation_not_found) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_relation_not_found),
+      kind: 'not_found',
+      resource_role: 'relation',
+      resource_type: 'relation'
+    ), status: :not_found
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
   end
 
   # DELETE /projects/:project_id/canvas_gantt/relations/:id.json
   def destroy_relation
     relation = IssueRelation.find(params[:id])
     return unless ensure_relation_editable!(relation)
+    issue_from, issue_to = @authorized_relation_endpoints
 
     relation.destroy
-    render json: { status: 'ok' }
+    render json: mutation_response(
+      status: 'ok',
+      completeness: 'partial',
+      invalidated_entity_ids: [issue_from.id, issue_to.id],
+      deleted_entity_ids: [relation.id]
+    )
   rescue ActiveRecord::RecordNotFound
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_relation_not_found) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_relation_not_found),
+      kind: 'not_found',
+      resource_role: 'relation',
+      resource_type: 'relation'
+    ), status: :not_found
   rescue => e
-    render json: { error: e.message }, status: :internal_server_error
+    render_internal_error(e)
   end
 
   private
+
+  # Redmine deliberately ignores its session for JSON/XML API requests. Canvas
+  # Gantt is a same-origin browser UI, so its JSON requests must retain the
+  # authenticated page session unless the caller supplied explicit API auth.
+  def api_request?
+    return false if canvas_gantt_session_json_request?
+
+    super
+  end
+
+  def canvas_gantt_session_json_request?
+    params[:format].to_s == 'json' &&
+      session[:user_id].present? &&
+      params[:key].blank? &&
+      request.headers['X-Redmine-API-Key'].blank? &&
+      request.authorization.blank?
+  end
 
   def canvas_gantt_l(key, **options)
     l(:"canvas_gantt.#{key}", **options)
@@ -622,7 +815,7 @@ class CanvasGanttsController < ApplicationController
   end
 
   def ensure_baseline_edit_permission
-    return true if User.current.allowed_to?(:edit_canvas_gantt, @project)
+    return true if User.current.allowed_to?(:manage_canvas_gantt_baseline, @project)
 
     render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
     false
@@ -632,7 +825,7 @@ class CanvasGanttsController < ApplicationController
     @permissions ||= {
       editable: User.current.allowed_to?(:edit_issues, @project),
       viewable: User.current.allowed_to?(:view_canvas_gantt, @project),
-      baseline_editable: User.current.allowed_to?(:edit_canvas_gantt, @project)
+      baseline_editable: User.current.allowed_to?(:manage_canvas_gantt_baseline, @project)
     }
   end
 
@@ -655,7 +848,23 @@ class CanvasGanttsController < ApplicationController
   end
 
   def baseline_project_issues(project_ids)
-    Issue.visible.where(project_id: project_ids).includes(*ISSUE_INCLUDES).to_a
+    data_payload_budget.load_records(
+      Issue.visible.where(project_id: project_ids).select(:id, :start_date, :due_date),
+      resource: 'baseline_issues',
+      limit: data_payload_budget.issue_limit
+    )
+  end
+
+  def visible_baseline_snapshot(snapshot, project_ids)
+    return nil unless snapshot
+
+    issue_ids = snapshot.task_states.map(&:issue_id)
+    visible_issue_ids = if issue_ids.empty?
+                          []
+                        else
+                          Issue.visible.where(project_id: project_ids, id: issue_ids).pluck(:id)
+                        end
+    snapshot.with_task_states(visible_issue_ids)
   end
 
   def baseline_save_scope
@@ -681,30 +890,93 @@ class CanvasGanttsController < ApplicationController
       params: params,
       current_user: User.current,
       issue_scope: Issue.visible,
-      issue_includes: ISSUE_INCLUDES
+      issue_includes: DATA_ISSUE_INCLUDES,
+      data_payload_budget: data_payload_budget
     )
   end
 
   def filter_option_projects(project_ids, member_projects_only: false)
-    if member_projects_only
-      if User.current&.admin?
-        Project.visible.active.to_a
-      else
-        return [] if member_candidate_ids.empty?
+    scope = if member_projects_only
+              if User.current&.admin?
+                Project.visible.active
+              else
+                return [] if member_candidate_ids.empty?
 
-        Project.visible.active
-          .joins(:members)
-          .where(members: { user_id: member_candidate_ids })
-          .distinct
-          .to_a
-      end
-    else
-      Project.visible.active.where(id: candidate_project_ids(project_ids)).to_a
-    end
+                Project.visible.active
+                  .joins(:members)
+                  .where(members: { user_id: member_candidate_ids })
+                  .distinct
+              end
+            else
+              Project.visible.active.where(id: candidate_project_ids(project_ids))
+            end
+    data_payload_budget.load_records(
+      scope,
+      resource: 'projects',
+      limit: data_payload_budget.collection_limit
+    )
   end
 
   def filter_option_issues(project_ids)
-    Issue.visible.where(project_id: project_ids).includes(:assigned_to, :project).to_a
+    scope = Issue.visible.where(project_id: project_ids)
+      .select(:id, :assigned_to_id, :project_id)
+      .includes(:assigned_to)
+    data_payload_budget.load_records(
+      scope,
+      resource: 'filter_issues',
+      limit: data_payload_budget.issue_limit
+    )
+  end
+
+  # Keep tracker candidates independent from the filtered task collection and
+  # avoid materializing every visible Issue.  Issue.visible remains the
+  # permission boundary; the distinct projection is O(project-tracker
+  # memberships) and the tracker name is fetched in the same query.
+  def filter_option_trackers(project_ids)
+    rows = Issue.visible
+      .where(project_id: project_ids)
+      .where.not(tracker_id: nil)
+      .joins(:tracker)
+      .distinct
+      .limit(data_payload_budget.collection_limit + 1)
+      .pluck(:tracker_id, :project_id, 'trackers.name')
+    data_payload_budget.ensure_count!(rows, resource: 'trackers')
+    rows.map { |tracker_id, project_id, name| { id: tracker_id, project_id: project_id, name: name } }
+  end
+
+  def render_internal_error(error)
+    request_id = request.request_id
+    Rails.logger.error("[Canvas Gantt][#{request_id}] #{error.class}: #{error.message}\n#{Array(error.backtrace).join("\n")}")
+    render json: { error: "#{canvas_gantt_l(:label_unknown_error)} (request ID: #{request_id})" }, status: :internal_server_error
+  end
+
+  # Mutation responses retain the legacy top-level fields while exposing the
+  # lifecycle metadata needed by newer clients. All fields are additive so
+  # existing Redmine integrations can continue to ignore them.
+  def mutation_response(status:, completeness:, entity: nil, revision: nil, invalidated_entity_ids: [], deleted_entity_ids: [], failure: nil)
+    {
+      status: status,
+      completeness: completeness,
+      **(entity ? { entity: entity } : {}),
+      **(revision ? { revision: revision } : {}),
+      invalidated_entity_ids: Array(invalidated_entity_ids).compact.map(&:to_i).uniq,
+      **(deleted_entity_ids.empty? ? {} : { deleted_entity_ids: Array(deleted_entity_ids).compact.map(&:to_i).uniq }),
+      **(failure ? { failure: failure } : {})
+    }
+  end
+
+  def mutation_failure_response(error:, kind:, resource_role:, resource_type:, resource_id: nil, remote_availability: nil)
+    mutation_response(
+      status: kind,
+      completeness: 'partial',
+      failure: {
+        kind: kind,
+        resource_role: resource_role,
+        resource_type: resource_type,
+        **(resource_id ? { resource_id: resource_id } : {}),
+        **(remote_availability ? { remote_availability: remote_availability } : {})
+      }
+    ).merge(error: error)
   end
 
   def member_candidate_ids
@@ -747,15 +1019,28 @@ class CanvasGanttsController < ApplicationController
     query.visibility.to_i == 2
   end
 
-  def ensure_issue_in_scope(issue)
-    return true if current_view_issue_ids.include?(issue.id)
+  def ensure_issue_in_scope(issue, resource_role: 'scope', resource_type: 'task')
+    return true if mutation_scope_issue?(issue)
 
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_issue_not_found_in_project) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_issue_not_found_in_project),
+      kind: 'not_found',
+      resource_role: resource_role,
+      resource_type: resource_type,
+      resource_id: resource_role == 'target' ? issue&.id : nil
+    ), status: :not_found
     false
   end
 
   def ensure_issue_editable(issue)
     return true if issue_editable?(issue)
+
+    render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
+    false
+  end
+
+  def ensure_issue_deletable(issue)
+    return true if User.current.allowed_to?(:delete_issues, issue.project) && issue.deletable?
 
     render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
     false
@@ -776,21 +1061,108 @@ class CanvasGanttsController < ApplicationController
     params.require(:task).permit(*(TASK_PERMITTED_ATTRIBUTES + [{ custom_field_values: {} }]))
   end
 
+  def preprocess_draft_intent(issue, intent)
+    normalized_intent = intent.to_h.symbolize_keys
+    mode = normalized_intent.delete(:date_update_mode)
+    calendar_project = nil
+    needs_authorized_target_context = normalized_intent.key?(:parent_issue_id) ||
+                                      normalized_intent.key?(:start_date) ||
+                                      normalized_intent.key?(:due_date)
+
+    if normalized_intent.key?(:project_id) && needs_authorized_target_context
+      target_project_id = Integer(normalized_intent[:project_id], exception: false)
+      return normalized_intent unless target_project_id
+
+      if target_project_id != issue.project_id
+        calendar_project = task_date_calendar_project(issue, normalized_intent)
+        # Keep the evaluator's established permission/invalid-target error contract,
+        # but do not inspect parent or calendar state for an unauthorized target.
+        return normalized_intent unless calendar_project
+      end
+    end
+
+    if normalized_intent.key?(:parent_issue_id)
+      load_parent_issue(issue, normalized_intent[:parent_issue_id])
+      return normalized_intent if performed?
+    end
+
+    return normalized_intent unless normalized_intent.key?(:start_date) || normalized_intent.key?(:due_date)
+
+    calendar_project ||= issue.project
+
+    return normalized_intent unless normalize_task_date_attributes!(
+      normalized_intent,
+      issue,
+      project: calendar_project,
+      mode: parse_date_update_mode(mode)
+    )
+
+    normalized_intent
+  end
+
+  def normalize_task_date_attributes!(task_attributes, issue, project: issue.project, mode: requested_date_update_mode)
+    return true unless task_attributes.key?(:start_date) || task_attributes.key?(:due_date)
+
+    start_value = task_attributes.key?(:start_date) ? task_attributes[:start_date] : issue.start_date
+    due_value = task_attributes.key?(:due_date) ? task_attributes[:due_date] : issue.due_date
+    normalized = business_calendar_resolver.normalize_date_interval(
+      start_date: start_value,
+      due_date: due_value,
+      changed_fields: task_attributes.slice(:start_date, :due_date).keys,
+      project: project,
+      mode: mode
+    )
+    unless normalized[:valid]
+      render json: { errors: [canvas_gantt_l(:error_canvas_gantt_invalid_dates)] }, status: :unprocessable_entity
+      return false
+    end
+
+    if task_attributes.key?(:start_date) && normalized[:start_date].present?
+      task_attributes[:start_date] = normalized[:start_date]
+    end
+    if task_attributes.key?(:due_date) && normalized[:due_date].present?
+      task_attributes[:due_date] = normalized[:due_date]
+    end
+    true
+  end
+
+  def requested_date_update_mode
+    parse_date_update_mode(params.dig(:task, :date_update_mode))
+  end
+
+  def parse_date_update_mode(value)
+    raw_mode = value.to_s
+    %w[move resize_start resize_due direct_edit project_move legacy_unspecified].include?(raw_mode) ? raw_mode.to_sym : :legacy_unspecified
+  end
+
+  def task_date_calendar_project(issue, task_attributes)
+    raw_project_id = task_attributes[:project_id] || task_attributes['project_id']
+    target_project_id = Integer(raw_project_id, exception: false)
+    return issue.project unless target_project_id && target_project_id != issue.project_id
+
+    target = Project.visible.find_by(id: target_project_id)
+    return nil unless target
+    return nil unless current_view_scope[:scope_project_ids].map(&:to_i).include?(target.id.to_i)
+    return nil unless User.current.allowed_to?(:add_issues, target)
+
+    target
+  end
+
   def relation_params
     params.require(:relation).permit(:issue_from_id, :issue_to_id, :relation_type, :delay)
   end
 
   def ensure_relation_editable!(relation)
-    issue_from = relation.issue_from
-    issue_to = relation.issue_to
+    issue_from, issue_to = visible_relation_endpoints(relation)
+    return false unless issue_from && issue_to
 
-    if issue_from.nil? || issue_to.nil?
-      render json: { error: canvas_gantt_l(:error_canvas_gantt_relation_not_found) }, status: :not_found
-      return false
-    end
-
-    unless current_view_issue_ids.include?(issue_from.id) && current_view_issue_ids.include?(issue_to.id)
-      render json: { error: canvas_gantt_l(:error_canvas_gantt_relation_not_found_in_project) }, status: :not_found
+    unless mutation_scope_issue?(issue_from) && mutation_scope_issue?(issue_to)
+      render json: mutation_failure_response(
+        error: canvas_gantt_l(:error_canvas_gantt_relation_not_found_in_project),
+        kind: 'not_found',
+        resource_role: 'relation',
+        resource_type: 'relation'
+      ), status: :not_found
       return false
     end
 
@@ -799,12 +1171,28 @@ class CanvasGanttsController < ApplicationController
       return false
     end
 
+    @authorized_relation_endpoints = [issue_from, issue_to]
     true
   end
 
+  def visible_relation_endpoints(relation)
+    ids = [relation.issue_from_id, relation.issue_to_id]
+    return nil if ids.any?(&:nil?)
+
+    ids.map { |issue_id| Issue.visible.find(issue_id) }
+  rescue ActiveRecord::RecordNotFound
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_relation_not_found),
+      kind: 'not_found',
+      resource_role: 'relation',
+      resource_type: 'relation'
+    ), status: :not_found
+    nil
+  end
+
   def ensure_relation_createable!(issue_from, issue_to)
-    return false unless ensure_issue_in_scope(issue_from)
-    return false unless ensure_issue_in_scope(issue_to)
+    return false unless ensure_issue_in_scope(issue_from, resource_role: 'relation', resource_type: 'relation')
+    return false unless ensure_issue_in_scope(issue_to, resource_role: 'relation', resource_type: 'relation')
     return false unless ensure_issue_editable(issue_from)
     return false unless ensure_issue_editable(issue_to)
 
@@ -847,7 +1235,7 @@ class CanvasGanttsController < ApplicationController
       issue_to: issue_to,
       relation_type: relation_type,
       delay: delay,
-      existing_relations: build_relations(current_view_scope[:issues]),
+      existing_relations: build_relations(mutation_scope_issues),
       candidate_relation: build_candidate_relation(
         relation_id: relation_id,
         issue_from: issue_from,
@@ -862,10 +1250,31 @@ class CanvasGanttsController < ApplicationController
     )
   end
 
+  def mutation_scope_issue?(issue)
+    return false unless issue
+
+    scope_project_ids = current_view_scope[:scope_project_ids]
+    return false if scope_project_ids.blank?
+
+    # The endpoint already loaded the record through Issue.visible.  Scope
+    # authorization therefore only needs the operation project boundary; a
+    # second visible query would both waste a query and make the policy depend
+    # on the current filtered collection.
+    scope_project_ids.include?(issue.project_id)
+  end
+
+  def mutation_scope_issues
+    return Array(current_view_scope[:issues]) if current_view_scope[:scope_project_ids].blank?
+
+    @mutation_scope_issues ||= Issue.visible
+      .where(project_id: current_view_scope[:scope_project_ids])
+      .includes(ISSUE_INCLUDES)
+      .to_a
+  end
+
   def save_relation_change(relation:, issue_from:, issue_to:, relation_id:, replacing_relation_id: nil)
     relation_type = relation_params[:relation_type].to_s
     return unless ensure_editable_relation_type!(relation_type)
-
     delay = normalized_relation_delay(relation_type)
     return if performed?
     return unless ensure_relation_change_valid!(
@@ -894,8 +1303,15 @@ class CanvasGanttsController < ApplicationController
   end
 
   def render_relation_save_result(relation)
-    if relation.save
-      render json: { status: 'ok', relation: relation_params_normalizer.serialize_relation(relation) }
+    saved = RedmineCanvasGantt::ScheduleCalendarContext.with(resolver: business_calendar_resolver) do
+      relation.save
+    end
+    if saved
+      render json: mutation_response(
+        status: 'ok',
+        completeness: 'complete',
+        invalidated_entity_ids: [relation.issue_from_id, relation.issue_to_id]
+      ).merge(relation: relation_params_normalizer.serialize_relation(relation))
     else
       render json: { errors: relation.errors.full_messages }, status: :unprocessable_entity
     end
@@ -928,12 +1344,17 @@ class CanvasGanttsController < ApplicationController
     parent_issue_resolver.call(
       source_issue: source_issue,
       raw_parent_issue_id: raw_parent_issue_id,
-      issue_scope_checker: method(:ensure_issue_in_scope),
+      issue_scope_checker: method(:mutation_scope_issue?),
       validation_error_renderer: lambda { |message_key|
         render json: { errors: [canvas_gantt_l(message_key)] }, status: :unprocessable_entity
       },
       not_found_renderer: lambda { |message_key|
-        render json: { error: canvas_gantt_l(message_key) }, status: :not_found
+        render json: mutation_failure_response(
+          error: canvas_gantt_l(message_key),
+          kind: 'not_found',
+          resource_role: 'reference',
+          resource_type: 'parent_task'
+        ), status: :not_found
       }
     )
   end
@@ -952,8 +1373,42 @@ class CanvasGanttsController < ApplicationController
   def data_payload_builder
     @data_payload_builder ||= RedmineCanvasGantt::DataPayloadBuilder.new(
       custom_field_extractor: custom_field_extractor,
-      current_user: User.current
+      current_user: User.current,
+      data_payload_budget: data_payload_budget
     )
+  end
+
+  def data_payload_budget
+    @data_payload_budget ||= RedmineCanvasGantt::DataPayloadBudget.new
+  end
+
+  def data_relations(issues)
+    issue_ids = issues.map(&:id)
+    return [] if issue_ids.empty?
+
+    scope = IssueRelation.where(issue_from_id: issue_ids, issue_to_id: issue_ids).order(:id)
+    data_payload_budget.load_records(
+      scope,
+      resource: 'relations',
+      limit: data_payload_budget.relation_limit
+    )
+  end
+
+  def bounded_data_collection(records, resource:)
+    data_payload_budget.ensure_count!(
+      records,
+      resource: resource,
+      limit: data_payload_budget.collection_limit
+    )
+  end
+
+  def render_data_payload_limit(error)
+    render json: {
+      error: canvas_gantt_l(:error_canvas_gantt_data_scope_too_large),
+      code: 'canvas_gantt_payload_limit',
+      resource: error.resource,
+      limit: error.limit
+    }, status: 413
   end
 
   def relation_params_normalizer
@@ -971,9 +1426,62 @@ class CanvasGanttsController < ApplicationController
     @edit_meta_payload_builder ||= RedmineCanvasGantt::EditMetaPayloadBuilder.new(current_user: User.current)
   end
 
+  def issue_draft_evaluator
+    RedmineCanvasGantt::IssueDraftEvaluator.new(
+      current_user: User.current,
+      project_scope_ids: current_view_scope[:scope_project_ids]
+    )
+  end
+
+  def schedule_mutation_coordinator
+    RedmineCanvasGantt::ScheduleMutationCoordinator.new(
+      current_user: User.current,
+      project_scope_ids: current_view_scope[:scope_project_ids],
+      payload_builder: data_payload_builder,
+      calendar_resolver: business_calendar_resolver
+    )
+  end
+
   def relation_change_validator
     @relation_change_validator ||= RedmineCanvasGantt::RelationChangeValidator.new(
-      non_working_week_days: relation_non_working_week_days
+      non_working_week_days: relation_non_working_week_days,
+      calendar_service: business_calendar_resolver
+    )
+  end
+
+  def business_calendar_resolver
+    @business_calendar_resolver ||= RedmineCanvasGantt::ProjectCalendarResolver.new(
+      fallback_non_working_week_days: Setting.non_working_week_days
+    )
+  end
+
+  def ensure_business_calendar_revision
+    expected_revision = request.headers[BUSINESS_CALENDAR_REVISION_HEADER].presence
+    return if expected_revision.nil?
+
+    actual_revision = business_calendar_resolver.revision.to_s
+    return if expected_revision == actual_revision
+
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_business_calendar_changed),
+      kind: 'conflict',
+      resource_role: 'scope',
+      resource_type: 'business_calendar',
+      resource_id: actual_revision,
+      remote_availability: 'needs_refresh'
+    ).merge(
+      conflict: {
+        expected_calendar_revision: expected_revision,
+        actual_calendar_revision: actual_revision
+      }
+    ), status: :conflict
+  end
+
+  def business_calendar_projects(project_ids)
+    data_payload_budget.load_records(
+      Project.where(id: project_ids),
+      resource: 'business_calendar_projects',
+      limit: data_payload_budget.collection_limit
     )
   end
 
@@ -995,49 +1503,194 @@ class CanvasGanttsController < ApplicationController
       params: params,
       current_user: User.current,
       issue_includes: ISSUE_INCLUDES
-    ).resolve
+    ).then { |resolver| { scope_project_ids: resolver.project_scope_ids } }
   end
 
   def current_view_issue_ids
-    current_view_scope[:issue_ids]
+    Set.new(Array(current_view_scope[:issue_ids]))
   end
 
-  def original_project_move_values(issue)
+  def render_edit_meta(intent:, require_editable: false)
+    issue = Issue.visible.find(params[:id])
+    return unless ensure_issue_in_scope(issue)
+    return unless ensure_issue_editable(issue) if require_editable
+
+    persisted_task = edit_meta_payload_builder.task_payload(issue)
+    persisted_project_options = nil
+    if intent.present?
+      if stale_draft_revision?(issue, intent)
+        evaluation = stale_draft_evaluation(issue, intent)
+      else
+        persisted_project_options = edit_meta_payload_builder.resolved_project_options(
+          issue: issue,
+          project_scope_ids: current_view_scope[:scope_project_ids]
+        )
+        intent = preprocess_draft_intent(issue, intent)
+        return if performed?
+        evaluation = issue_draft_evaluator.evaluate(issue: issue, intent: intent)
+      end
+    end
+    if evaluation
+      permission_violation = evaluation.violations.find { |entry| entry[:code] == 'permission_denied' }
+      if permission_violation
+        render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
+        return
+      end
+    end
+
+    persisted_project_options ||= edit_meta_payload_builder.resolved_project_options(
+      issue: issue,
+      project_scope_ids: current_view_scope[:scope_project_ids]
+    )
+
+    capability_issue = evaluation&.issue || issue
+    editable = User.current.allowed_to?(:edit_issues, capability_issue.project) && capability_issue.editable?
+    field_editable = build_field_editable(capability_issue, editable)
+    custom_fields, custom_field_values = custom_field_extractor.extract_custom_fields(
+      capability_issue,
+      inline_custom_fields_enabled? && field_editable[:custom_field_values]
+    )
+
+    render json: edit_meta_payload_builder.build(
+      issue: issue,
+      persisted_task: persisted_task,
+      editable: field_editable,
+      custom_fields: custom_fields,
+      custom_field_values: custom_field_values,
+      permissions: @permissions,
+      project_scope_ids: current_view_scope[:scope_project_ids],
+      project_options: persisted_project_options,
+      capability_issue: capability_issue,
+      capability_context: edit_meta_capability_context(issue, capability_issue),
+      draft_contract: evaluation&.draft_contract
+    )
+  end
+
+  def legacy_edit_meta_intent
     {
-      project_id: issue.project_id,
-      tracker_id: issue.tracker_id,
-      assigned_to_id: issue.assigned_to_id,
-      fixed_version_id: issue.fixed_version_id,
-      category_id: issue.category_id
+      project_id: edit_meta_context_integer(:target_project_id),
+      tracker_id: edit_meta_context_integer(:target_tracker_id),
+      status_id: edit_meta_context_integer(:target_status_id)
+    }.compact
+  end
+
+  def raw_task_intent
+    params.require(:task).to_unsafe_h.transform_keys(&:to_sym)
+  end
+
+  def draft_task_intent
+    raw_task_intent
+  end
+
+  def edit_meta_context_integer(key)
+    value = params[key].presence
+    parsed = Integer(value, exception: false)
+    parsed if parsed&.positive?
+  end
+
+  def edit_meta_capability_context(issue, capability_issue)
+    {
+      task_id: issue.id,
+      project_id: capability_issue.project_id,
+      tracker_id: capability_issue.tracker_id,
+      status_id: capability_issue.status_id
     }
   end
 
-  def edit_meta_options_project(issue)
-    raw_project_id = params[:target_project_id].presence
-    return issue.project unless raw_project_id
-
-    target_project_id = Integer(raw_project_id, exception: false)
-    return issue.project unless target_project_id && target_project_id != issue.project_id
-
-    target_project = Project.visible.find(target_project_id)
-    unless current_view_scope[:scope_project_ids].include?(target_project.id) &&
-           User.current.allowed_to?(:add_issues, target_project)
-      render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
-      return nil
-    end
-
-    target_project
+  def render_edit_meta_not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_task_not_found),
+      kind: 'not_found',
+      resource_role: 'target',
+      resource_type: 'task',
+      resource_id: params[:id]
+    ), status: :not_found
   end
 
-  def ensure_issue_in_operation_scope(issue)
+  def render_draft_evaluation_failure(evaluation, issue)
+    if evaluation.violations.any? { |entry| entry[:code] == 'permission_denied' }
+      render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
+      return
+    end
+    if evaluation.violations.any? { |entry| entry[:code] == 'stale_revision' }
+      render_stale_revision_conflict(issue)
+      return
+    end
+
+    render json: {
+      status: 'validation_error',
+      errors: evaluation.violations.map { |entry| entry[:message] },
+      draft_contract: evaluation.draft_contract
+    }, status: :unprocessable_entity
+  end
+
+  def stale_draft_revision?(issue, intent)
+    normalized_intent = intent.to_h.symbolize_keys
+    normalized_intent.key?(:lock_version) && normalized_intent[:lock_version].to_i != issue.lock_version.to_i
+  end
+
+  def stale_draft_evaluation(issue, intent)
+    raw_intent = intent.to_h.symbolize_keys
+    violation = {
+      field: 'lock_version',
+      code: 'stale_revision',
+      message: 'The issue was updated by another request.'
+    }
+    RedmineCanvasGantt::IssueDraftEvaluator::Result.new(
+      issue: issue,
+      base_revision: issue.lock_version.to_i,
+      user_intent: raw_intent.slice(*RedmineCanvasGantt::IssueDraftEvaluator::INTENT_FIELDS),
+      policy_intent: {},
+      materialized: {},
+      normalizations: [],
+      violations: [violation]
+    )
+  end
+
+  def render_stale_revision_conflict(issue)
+    render json: mutation_response(
+      status: 'conflict',
+      completeness: 'partial',
+      entity: data_payload_builder.build_task_state(issue),
+      revision: issue.lock_version
+    ).merge(error: canvas_gantt_l(:error_canvas_gantt_conflict_reload)), status: :conflict
+  end
+
+  def ensure_issue_in_operation_scope(issue, resource_role: 'scope', resource_type: 'task')
     operation_issue_ids = requested_operation_issue_ids
     return true if operation_issue_ids.blank?
 
-    authorized_operation_issue_ids = operation_issue_ids & current_view_issue_ids
+    authorized_operation_issue_ids = operation_issue_ids & mutation_scope_issues.map(&:id).to_set
     return true if authorized_operation_issue_ids.include?(issue.id)
 
-    render json: { error: canvas_gantt_l(:error_canvas_gantt_issue_not_found_in_project) }, status: :not_found
+    render json: mutation_failure_response(
+      error: canvas_gantt_l(:error_canvas_gantt_issue_not_found_in_project),
+      kind: 'not_found',
+      resource_role: resource_role,
+      resource_type: resource_type,
+      resource_id: resource_role == 'target' ? issue&.id : nil
+    ), status: :not_found
     false
+  end
+
+  def business_calendar_revision_required?
+    case action_name.to_sym
+    when :schedule_mutation
+      true
+    when :edit_meta_preview, :update
+      calendar_sensitive_task_intent?(params[:task])
+    when :create_relation, :update_relation
+      DELAY_RELATION_TYPES.include?(params.dig(:relation, :relation_type).to_s)
+    else
+      false
+    end
+  end
+
+  def calendar_sensitive_task_intent?(intent)
+    return false unless intent.respond_to?(:key?)
+
+    intent.key?(:start_date) || intent.key?('start_date') ||
+      intent.key?(:due_date) || intent.key?('due_date')
   end
 
   def requested_operation_issue_ids
@@ -1048,52 +1701,4 @@ class CanvasGanttsController < ApplicationController
       .to_set
   end
 
-  def ensure_project_move_valid!(issue, original_values)
-    destination_project = issue.project
-    return true unless destination_project
-    task_params = permitted_task_params
-    return true unless task_params.key?(:project_id) || task_params.key?('project_id')
-    return true if original_values[:project_id].to_i == destination_project.id.to_i
-
-    unless current_view_scope[:scope_project_ids].include?(destination_project.id) &&
-           User.current.allowed_to?(:add_issues, destination_project)
-      render json: { error: canvas_gantt_l(:error_canvas_gantt_permission_denied) }, status: :forbidden
-      return false
-    end
-
-    destination_tracker_ids = destination_project.trackers.map(&:id)
-    requested_tracker_id = requested_integer_param(task_params, :tracker_id)
-    unless destination_tracker_ids.include?(original_values[:tracker_id]) &&
-           (requested_tracker_id.nil? || destination_tracker_ids.include?(requested_tracker_id))
-      issue.errors.add(:tracker, :invalid)
-      render json: { errors: issue.errors.full_messages }, status: :unprocessable_entity
-      return false
-    end
-
-    destination_assignable_ids = destination_project.assignable_users.map(&:id)
-    requested_assigned_to_id = requested_integer_param(task_params, :assigned_to_id)
-    original_assignee_invalid = original_values[:assigned_to_id].present? &&
-                                !destination_assignable_ids.include?(original_values[:assigned_to_id])
-    requested_assignee_invalid = requested_assigned_to_id.present? &&
-                                 !destination_assignable_ids.include?(requested_assigned_to_id)
-    if original_assignee_invalid || requested_assignee_invalid
-      issue.errors.add(:assigned_to, :invalid)
-      render json: { errors: issue.errors.full_messages }, status: :unprocessable_entity
-      return false
-    end
-
-    issue.fixed_version = nil if issue.fixed_version && issue.fixed_version.project_id != destination_project.id
-    if issue.category && issue.category.project_id != destination_project.id
-      issue.category = nil
-    end
-
-    true
-  end
-
-  def requested_integer_param(task_params, key)
-    raw_value = task_params[key] || task_params[key.to_s]
-    return nil if raw_value.blank?
-
-    Integer(raw_value, exception: false)
-  end
 end

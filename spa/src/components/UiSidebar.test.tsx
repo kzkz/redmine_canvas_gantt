@@ -9,6 +9,7 @@ import { SIDEBAR_RESIZE_CURSOR, SIDEBAR_DRAG_EDGE_TOLERANCE } from '../constants
 import { resetCanvasGanttTestState } from '../test/testSetup';
 import { buildColumnSettingsFromVisibleKeys } from '../components/sidebar/sidebarColumnSettings';
 import { getColumnDefinitions } from '../components/sidebar/sidebarColumnCatalog';
+import { parseDateOnly } from '../utils/dateOnly';
 
 describe('UiSidebar', () => {
     const initialUpdateViewport = useTaskStore.getState().updateViewport;
@@ -81,6 +82,7 @@ describe('UiSidebar', () => {
         document.body.style.cursor = '';
         document.body.style.userSelect = '';
         resetCanvasGanttTestState();
+        useTaskStore.setState({ autoSave: true });
     });
 
     afterEach(() => {
@@ -125,6 +127,33 @@ describe('UiSidebar', () => {
 
         expect(screen.getByText('ID')).toBeInTheDocument();
         expect(screen.getByTestId('task-id-123')).toHaveTextContent('123');
+    });
+
+    it('renders the author as read-only metadata', () => {
+        const columnSettings = buildColumnSettingsFromVisibleKeys(getColumnDefinitions(), ['author']);
+        useUIStore.setState({ visibleColumns: ['author'], columnSettings });
+        useTaskStore.setState({
+            viewport: { startDate: 0, scrollX: 0, scrollY: 0, scale: 1, width: 800, height: 600, rowHeight: 32 },
+            groupByProject: false
+        });
+        useTaskStore.getState().setTasks([{
+            id: 'author-task',
+            subject: 'Authored task',
+            authorId: 9,
+            authorName: 'Original Author',
+            ratioDone: 0,
+            statusId: 1,
+            lockVersion: 1,
+            editable: true,
+            rowIndex: 0,
+            hasChildren: false
+        }]);
+
+        render(<UiSidebar />);
+
+        const cell = screen.getByTestId('cell-author-task-author');
+        expect(cell).toHaveTextContent('Original Author');
+        expect(cell.querySelector('.task-cell-editable')).toBeNull();
     });
 
     it('renders the subject tracker icon from the trackerId map', () => {
@@ -818,7 +847,7 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
@@ -840,8 +869,8 @@ describe('UiSidebar', () => {
         const task: Task = {
             id: taskId,
             subject: 'Old',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -852,6 +881,12 @@ describe('UiSidebar', () => {
 
         useTaskStore.getState().setTasks([task]);
 
+        const fetchMock = vi.fn(async () => ({
+            ok: true,
+            json: async () => ({ lock_version: 2, task_id: taskId })
+        }));
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
         render(<UiSidebar />);
 
         const cell = await screen.findByTestId(`cell-${taskId}-startDate`);
@@ -859,7 +894,9 @@ describe('UiSidebar', () => {
             fireEvent.doubleClick(cell);
         });
 
-        const day = await screen.findByText('2');
+        const day = await screen.findByRole('gridcell', {
+            name: 'Choose Thursday, January 2nd, 2025'
+        });
         await act(async () => {
             fireEvent.click(day);
         });
@@ -867,12 +904,20 @@ describe('UiSidebar', () => {
         // Date changes should update local state only (for batch save)
         await waitFor(() => {
             const t = useTaskStore.getState().allTasks[0];
-            const expectedDate = new Date('2025-01-02').getTime();
+            const expectedDate = parseDateOnly('2025-01-02');
             expect(t?.startDate).toBe(expectedDate);
         });
+        await waitFor(() => {
+            expect(fetchMock).toHaveBeenCalledWith(
+                expect.stringContaining('/canvas_gantt/tasks/123.json'),
+                expect.objectContaining({ method: 'PATCH' })
+            );
+        });
 
-        // Verify task is marked for batch save
-        expect(useTaskStore.getState().modifiedTaskIds.has(taskId)).toBe(true);
+        // A successful inline operation commits its matching local patch.
+        expect(useTaskStore.getState().modifiedTaskIds.has(taskId)).toBe(false);
+        expect(useTaskStore.getState().serverTaskSnapshot.entitiesById[taskId]?.startDate)
+            .toBe(parseDateOnly('2025-01-02'));
     });
 
     it('shows the version inline edit empty option using the version-specific unset label', async () => {
@@ -957,15 +1002,15 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
         const task: Task = {
             id: taskId,
             subject: 'Version task',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1069,7 +1114,7 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
@@ -1078,8 +1123,8 @@ describe('UiSidebar', () => {
             subject: 'Assignee task',
             assignedToId: 10,
             assignedToName: 'Alice Able',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1201,7 +1246,7 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
@@ -1210,8 +1255,8 @@ describe('UiSidebar', () => {
             subject: 'Unassign task',
             assignedToId: 10,
             assignedToName: 'Alice Able',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1633,15 +1678,15 @@ describe('UiSidebar', () => {
                     customFieldValues: { [String(customFieldId)]: 'A-001' }
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
         const task: Task = {
             id: taskId,
             subject: 'CF task',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1714,15 +1759,15 @@ describe('UiSidebar', () => {
                     customFieldValues: { [String(customFieldId)]: 'A-001' }
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
         const task: Task = {
             id: taskId,
             subject: 'CF task',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1822,15 +1867,15 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
         const task: Task = {
             id: taskId,
             subject: 'Compact row task',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             lockVersion: 1,
@@ -1927,15 +1972,15 @@ describe('UiSidebar', () => {
                     customFieldValues: {}
                 }
             },
-            loadingTaskId: null,
+            loadingByTaskId: {},
             error: null
         });
 
         const task: Task = {
             id: taskId,
             subject: 'Estimated hours task',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
             estimatedHours: 1.5,

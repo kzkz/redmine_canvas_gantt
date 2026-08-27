@@ -26,6 +26,13 @@ interface Notification {
     type: NotificationType;
 }
 
+export type ActiveInlineEdit = {
+    taskId: string;
+    field: string;
+    source?: 'cell' | 'panel';
+    sessionId?: string;
+};
+
 interface UIState {
     notifications: Notification[];
     showProgressLine: boolean;
@@ -33,13 +40,15 @@ interface UIState {
     showTaskBarDates: boolean;
     showHierarchyLines: boolean;
     showBaseline: boolean;
+    showStartDateOnly: boolean;
+    showDueDateOnly: boolean;
     visibleColumns: string[];
     columnSettings: ColumnConfig[];
     columnWidths: Record<string, number>;
     sidebarWidth: number;
     leftPaneVisible: boolean;
     rightPaneVisible: boolean;
-    activeInlineEdit: { taskId: string; field: string; source?: 'cell' | 'panel' } | null;
+    activeInlineEdit: ActiveInlineEdit | null;
     isFullScreen: boolean;
     issueDialogUrl: string | null;
     queryDialogUrl: string | null;
@@ -64,6 +73,8 @@ interface UIState {
     toggleBaseline: () => void;
     setShowBaseline: (value: boolean) => void;
     togglePointsOrphans: () => void;
+    toggleStartDateOnly: () => void;
+    toggleDueDateOnly: () => void;
     toggleLeftPane: () => void;
     toggleRightPane: () => void;
     showPointsOrphans: boolean;
@@ -77,7 +88,7 @@ interface UIState {
     resetColumns: () => void;
     setColumnWidth: (key: string, width: number) => void;
     setSidebarWidth: (width: number) => void;
-    setActiveInlineEdit: (value: { taskId: string; field: string; source?: 'cell' | 'panel' } | null) => void;
+    setActiveInlineEdit: (value: ActiveInlineEdit | null, ownerSessionId?: string) => void;
     setFullScreen: (value: boolean) => void;
     toggleFullScreen: () => void;
     openIssueDialog: (url: string) => void;
@@ -156,6 +167,8 @@ export const useUIStore = create<UIState>((set, get) => ({
     showHierarchyLines: displayPreferences.showHierarchyLines ?? true,
     showBaseline: displayPreferences.showBaseline ?? false,
     showPointsOrphans: displayPreferences.showPointsOrphans ?? true,
+    showStartDateOnly: displayPreferences.showStartDateOnly ?? displayPreferences.showPointsOrphans ?? true,
+    showDueDateOnly: displayPreferences.showDueDateOnly ?? displayPreferences.showPointsOrphans ?? true,
     leftPaneVisible: true,
     rightPaneVisible: true,
     visibleColumns: initialDisplayColumns.visibleColumns,
@@ -188,6 +201,10 @@ export const useUIStore = create<UIState>((set, get) => ({
     columnStateSource: 'preference',
     columnsExplicitInQuery: false,
     addNotification: (message, type = 'info') => {
+        if (get().notifications.some((notification) => (
+            notification.message === message && notification.type === type
+        ))) return;
+
         const id = Math.random().toString(36).substring(7);
         set((state) => ({
             notifications: [...state.notifications, { id, message, type }]
@@ -209,7 +226,12 @@ export const useUIStore = create<UIState>((set, get) => ({
     toggleHierarchyLines: () => set((state) => ({ showHierarchyLines: !state.showHierarchyLines })),
     toggleBaseline: () => set((state) => ({ showBaseline: !state.showBaseline })),
     setShowBaseline: (value) => set(() => ({ showBaseline: value })),
-    togglePointsOrphans: () => set((state) => ({ showPointsOrphans: !state.showPointsOrphans })),
+    togglePointsOrphans: () => set((state) => {
+        const next = !state.showPointsOrphans;
+        return { showPointsOrphans: next, showStartDateOnly: next, showDueDateOnly: next };
+    }),
+    toggleStartDateOnly: () => set((state) => ({ showStartDateOnly: !state.showStartDateOnly })),
+    toggleDueDateOnly: () => set((state) => ({ showDueDateOnly: !state.showDueDateOnly })),
     toggleLeftPane: () => set((state) => {
         if (state.leftPaneVisible && state.rightPaneVisible) {
             return { leftPaneVisible: false, rightPaneVisible: true };
@@ -283,7 +305,16 @@ export const useUIStore = create<UIState>((set, get) => ({
     },
     setColumnWidth: (key, width) => set((state) => ({ columnWidths: { ...state.columnWidths, [key]: width } })),
     setSidebarWidth: (width) => set(() => ({ sidebarWidth: width })),
-    setActiveInlineEdit: (value) => set(() => ({ activeInlineEdit: value })),
+    setActiveInlineEdit: (value, ownerSessionId) => set((state) => {
+        if (
+            value === null &&
+            ownerSessionId !== undefined &&
+            state.activeInlineEdit?.sessionId !== ownerSessionId
+        ) {
+            return {};
+        }
+        return { activeInlineEdit: value };
+    }),
     setFullScreen: (value) => set(() => ({ isFullScreen: value })),
     toggleFullScreen: () => set((state) => ({ isFullScreen: !state.isFullScreen })),
     openIssueDialog: (url) => set(() => ({ issueDialogUrl: buildRedmineUrl(url) })),

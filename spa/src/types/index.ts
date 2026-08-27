@@ -4,8 +4,8 @@ export interface Task {
     projectId?: string;
     projectName?: string;
     displayOrder?: number;
-    startDate?: number; // Timestamp
-    dueDate?: number; // Timestamp
+    startDate?: number; // CalendarDate canonical encoding (UTC midnight, not an instant)
+    dueDate?: number; // CalendarDate canonical encoding (UTC midnight, not an instant)
     ratioDone: number;
     statusId: number;
     assignedToId?: number | null;
@@ -39,6 +39,16 @@ export interface Task {
     treeLevelGuides?: boolean[];
     isLastChild?: boolean;
 }
+
+/** Fields persisted by Redmine and safe to store as mutation canonical state. */
+export type PersistedTaskState = Pick<Task, 'id'> & Partial<Pick<Task,
+    'subject' | 'projectId' | 'projectName' | 'startDate' | 'dueDate' |
+    'ratioDone' | 'statusId' | 'assignedToId' | 'assignedToName' | 'parentId' |
+    'lockVersion' | 'trackerId' | 'trackerName' | 'fixedVersionId' |
+    'priorityId' | 'priorityName' | 'priorityPosition' | 'authorId' | 'authorName' |
+    'categoryId' | 'categoryName' | 'estimatedHours' | 'createdOn' | 'updatedOn' |
+    'statusName' | 'spentHours' | 'fixedVersionName' | 'customFieldValues'
+>>;
 
 export interface Relation {
     id: string;
@@ -92,9 +102,17 @@ export interface FilterAssigneeOption {
     projectIds: string[];
 }
 
+export interface FilterTrackerOption {
+    id: number;
+    name: string;
+    projectIds: string[];
+}
+
 export interface FilterOptions {
     projects: FilterProjectOption[];
     assignees: FilterAssigneeOption[];
+    /** Optional for payloads from older plugin versions. */
+    trackers?: FilterTrackerOption[];
 }
 
 export interface TaskStatus {
@@ -109,6 +127,7 @@ export interface BusinessQueryState {
     selectedAssigneeIds: (number | null)[];
     selectedProjectIds: string[];
     selectedVersionIds: string[];
+    selectedTrackerIds: number[];
     memberProjectsOnly: boolean;
     sortConfig: { key: string; direction: 'asc' | 'desc' } | null;
     groupByProject: boolean;
@@ -117,7 +136,7 @@ export interface BusinessQueryState {
 }
 
 export interface Viewport {
-    startDate: number; // Timestamp of left edge
+    startDate: number; // Fixed-width Canvas timeline value at the left edge
     scrollX: number; // Horizontal scroll offset (pixels)
     scrollY: number; // Vertical scroll offset (pixels)
     scale: number; // Pixels per millisecond (or day)

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { BaselineRenderer } from './BaselineRenderer';
 import type { Task, Viewport } from '../types';
+import { parseDateOnly } from '../utils/dateOnly';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -49,6 +50,37 @@ const buildContext = () => ({
 });
 
 describe('BaselineRenderer', () => {
+    it('aligns a local-date baseline bar to UTC timeline cells', () => {
+        const ctx = buildContext();
+        const canvas = {
+            width: 800,
+            height: 600,
+            getContext: vi.fn().mockReturnValue(ctx)
+        } as unknown as HTMLCanvasElement;
+        const baselineStartDate = parseDateOnly('2026-01-01')!;
+        const baselineDueDate = parseDateOnly('2026-01-02')!;
+        const utcViewport = { ...viewport, startDate: Date.UTC(2026, 0, 1) };
+
+        new BaselineRenderer(canvas).render({
+            viewport: utcViewport,
+            tasks: [{ ...buildTask('1', 0), startDate: baselineStartDate, dueDate: baselineDueDate }],
+            rowCount: 1,
+            zoomLevel: 2,
+            showBaseline: true,
+            snapshot: {
+                snapshotId: 'baseline-1',
+                projectId: '1',
+                capturedAt: '2026-04-01T00:00:00.000Z',
+                scope: 'project',
+                tasksByIssueId: {
+                    '1': { issueId: '1', baselineStartDate, baselineDueDate }
+                }
+            }
+        });
+
+        expect(ctx.fillRect).toHaveBeenCalledWith(0, expect.any(Number), 2, expect.any(Number));
+    });
+
     it('draws a ghost bar when baseline has both start and due dates', () => {
         const ctx = buildContext();
         const canvas = {

@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { FilterOptions, Task, Relation, DraftRelation, Viewport, ViewMode, ZoomLevel, LayoutRow, Version, TaskStatus, SavedQuery } from '../types';
+import type { FilterOptions, Task, PersistedTaskState, Relation, DraftRelation, Viewport, ViewMode, ZoomLevel, LayoutRow, Version, TaskStatus, SavedQuery } from '../types';
 import { ZOOM_SCALES } from '../utils/grid';
 import { TaskLogicService } from '../services/TaskLogicService';
 import { loadPreferences, saveDisplayPreferences } from '../utils/preferences';
@@ -13,17 +13,30 @@ import type { LayoutState, SortConfig } from './taskStore/types';
 import { buildLayout, getVersionRowId, NO_VERSION_ID } from './taskStore/layout';
 import { applyFilters } from './taskStore/filters';
 import { isDescendantTask, tailDisplayOrderForParent, tailDisplayOrderForRoot } from './taskStore/hierarchy';
-import { computeCenteredViewport } from './taskStore/viewport';
+import {
+    clampViewportScrollY,
+    computeCenteredViewport,
+    computeFocusedViewport
+} from './taskStore/viewport';
 import { buildMoveTaskResult, saveModifiedTasks } from './taskStore/taskPersistence';
 import { runParentMove } from './taskStore/parentMove';
 import { buildUniformExpansionMaps, initializeExpansionMaps } from './taskStore/expansion';
 import { syncSharedQueryState, type SharedQuerySyncState } from './taskStore/querySync';
+import {
+    beginBarOperation as beginBarOperationState,
+    buildBarOperationRollback,
+    captureBarOperationBaselines,
+    endBarOperation as endBarOperationState,
+    settleBarOperationTaskOwnership,
+    type BarOperationRecord
+} from './taskStore/barOperations';
 import {
     clearSavedQueryToStandalone,
     isQueryModified as getIsQueryModified,
     selectSavedQuery,
     setAssigneeOverride,
     setStatusOverride,
+    setTrackerOverride,
     setVersionOverride
 } from '../query/queryState';
 import type { QueryContext, QueryOverrides } from '../query/types';
@@ -32,6 +45,30 @@ import { toBusinessQueryState } from '../query/resolvedQueryStateCodec';
 import type { SchedulingStateInfo } from '../scheduling/constraintGraph';
 import type { CriticalPathTaskMetrics } from '../scheduling/criticalPath';
 import { AutoScheduleMoveMode } from '../types/constraints';
+import { configureBusinessCalendar, normalizeTaskDateInterval } from '../utils/businessCalendar';
+import { fromLocalDate, parseDateOnly, toCalendarDate, toTimelineDate, todayCalendarDate } from '../utils/dateOnly';
+import { apiClient } from '../api/client';
+import type { MutationMetadata } from '../api/client';
+import { classifyMutationSourceDisposition } from '../api/mutationOutcome';
+import type { MutationRemoteAvailability } from '../api/mutationOutcome';
+import { buildTaskMutationDelta, BULK_TASK_FIELDS, PERSISTABLE_TASK_FIELDS, taskMutationFields, taskMutationService, type TaskFields } from '../services/taskMutationService';
+import {
+    applyLocalPatches,
+    settleLocalPatchFields,
+    canApplyReadResponse,
+    createReadContext,
+    createServerSnapshot,
+    replaceServerSnapshot,
+    mergeServerEntity,
+    hasLocalPatchOwnership,
+    hasLocalMutationIntent,
+    type DerivedInvalidation,
+    type LocalPatch,
+    type EntityTombstone,
+    type ReadApplyOutcome,
+    type ReadContext,
+    type ServerSnapshot
+} from './taskStore/stateContract';
 import {
     readIssueQueryParamsFromUrl,
     replaceIssueQueryParamsInUrl,
@@ -57,8 +94,99 @@ type ApiData = NonNullable<
     Awaited<ReturnType<typeof import('../api/client').apiClient.fetchData>>
 >;
 
-const queueRefreshData = (refreshData: () => Promise<void>) => {
+export type TaskConflictRecord = {
+    taskId: string;
+    message: string;
+    detectedAt: number;
+    generation?: number;
+    remoteEntity?: PersistedTaskState;
+    remoteRevision?: number;
+    remoteAvailability?: MutationRemoteAvailability;
+};
+
+const terminalTaskDeletionPatch = (
+    state: TaskState,
+    taskId: string,
+    source: EntityTombstone['source']
+): Partial<TaskState> => {
+    const finalTasks = state.allTasks.filter(task => task.id !== taskId);
+    const derived = buildDerivedTaskState(state, { allTasks: finalTasks });
+    const localTaskPatches = { ...state.localTaskPatches };
+    delete localTaskPatches[taskId];
+    const modifiedTaskIds = new Set(state.modifiedTaskIds);
+    modifiedTaskIds.delete(taskId);
+    const settlement = settleBarOperationTaskOwnership(
+        state.barOperations,
+        state.activeBarOperationId,
+        taskId,
+        { mode: 'all' }
+    );
+    return {
+        allTasks: finalTasks,
+        ...toDerivedTaskStatePatch(derived),
+        localTaskPatches,
+        modifiedTaskIds,
+        ...settlement,
+        taskConflicts: Object.fromEntries(
+            Object.entries(state.taskConflicts).filter(([conflictTaskId]) => conflictTaskId !== taskId)
+        ),
+        serverTaskSnapshot: {
+            ...state.serverTaskSnapshot,
+            entitiesById: Object.fromEntries(
+                Object.entries(state.serverTaskSnapshot.entitiesById).filter(([entityId]) => entityId !== taskId)
+            ),
+            revisions: Object.fromEntries(
+                Object.entries(state.serverTaskSnapshot.revisions).filter(([entityId]) => entityId !== taskId)
+            )
+        },
+        taskTombstones: {
+            ...state.taskTombstones,
+            [taskId]: { entityId: taskId, deletedAt: Date.now(), source }
+        }
+    };
+};
+
+type InitialDataParams = {
+    rawSearch?: string;
+    query?: ResolvedQueryState;
+    queryContext?: QueryContext;
+    initialState?: ResolvedQueryState;
+};
+
+let dataRequestGeneration = 0;
+const invalidateDataRequests = () => {
+    dataRequestGeneration += 1;
+};
+
+let saveChangesOperation: Promise<Map<string, string>> | null = null;
+let barOperationSequence = 0;
+
+const buildTaskPatchFieldsPayload = (task: Task, fields: Partial<Task>): Record<string, unknown> => {
+    return taskMutationFields({ ...task, ...fields }, Object.keys(fields));
+};
+
+export const readLifecycleMetrics = {
+    requestsStarted: 0,
+    responsesApplied: 0,
+    staleResponsesRejected: 0,
+    failures: 0,
+    maxInflight: 0
+};
+
+export const resetReadLifecycleMetrics = () => {
+    readLifecycleMetrics.requestsStarted = 0;
+    readLifecycleMetrics.responsesApplied = 0;
+    readLifecycleMetrics.staleResponsesRejected = 0;
+    readLifecycleMetrics.failures = 0;
+    readLifecycleMetrics.maxInflight = 0;
+};
+
+const queueRefreshData = (refreshData: () => Promise<ReadApplyOutcome>) => {
     queueMicrotask(() => {
+        // Each UI scope change is an explicit read invalidation. This keeps
+        // separately queued changes observable while identical direct
+        // refresh calls can still share an in-flight request.
+        dataRequestGeneration += 1;
         void refreshData().catch((error) => console.error('Failed to refresh data', error));
     });
 };
@@ -106,6 +234,7 @@ interface TaskState {
     selectedProjectIds: string[];
     projectSelectionExplicit: boolean;
     selectedVersionIds: string[];
+    selectedTrackerIds: number[];
     memberProjectsOnly: boolean;
 
     sortConfig: SortConfig;
@@ -116,8 +245,16 @@ interface TaskState {
 
     isSortingSuspended: boolean;
     modifiedTaskIds: Set<string>;
+    editGenerations: Record<string, number>;
     autoSave: boolean;
     initialDataLoaded: boolean;
+    activeReadContext: ReadContext | null;
+    serverTaskSnapshot: ServerSnapshot<Task>;
+    localTaskPatches: Record<string, Array<LocalPatch<Task>>>;
+    taskTombstones: Record<string, EntityTombstone>;
+    taskConflicts: Record<string, TaskConflictRecord>;
+    barOperations: Record<string, BarOperationRecord>;
+    activeBarOperationId: string | null;
 
     // Actions
     setAutoSave: (enabled: boolean) => void;
@@ -132,7 +269,7 @@ interface TaskState {
     restoreCanvasScope: (state?: ResolvedQueryState) => void;
     restoreExplicitGroupByOverride: (groupBy: ResolvedQueryState['groupBy'] | undefined) => void;
     applyResolvedQueryState: (state?: ResolvedQueryState) => void;
-    applyApiData: (data: ApiData) => void;
+    applyApiData: (data: ApiData, readContext?: ReadContext) => void;
     setSelectedStatusFromServer: (ids: number[]) => void;
     setShowVersions: (show: boolean) => void;
     addRelation: (relation: Relation) => void;
@@ -144,8 +281,23 @@ interface TaskState {
     clearRelationSelection: () => void;
     setHoveredTask: (id: string | null) => void;
     setContextMenu: (menu: { x: number; y: number; taskId: string } | null) => void;
-    updateTask: (id: string, updates: Partial<Task>) => void;
+    updateTask: (id: string, updates: Partial<Task>, mutationIntent?: Partial<Task>) => void;
+    beginBarOperation: (seedTaskId?: string) => string;
+    endBarOperation: (operationId: string) => void;
+    rollbackBarOperation: (operationId: string) => void;
+    settleBarOperationTask: (taskId: string, operationGeneration?: number) => void;
+    settleBarOperationTaskThrough: (taskId: string, operationGeneration: number) => void;
+    completeBarOperationTask: (taskId: string, operationGeneration?: number) => void;
+    setTaskLockVersion: (id: string, lockVersion: number) => void;
+    commitTaskOperation: (id: string, operationGeneration: number, lockVersion?: number) => void;
+    rollbackTaskOperation: (id: string, operationGeneration: number, rollbackFields?: Partial<Task>) => void;
+    applyTaskMutationMetadata: (taskId: string, metadata: MutationMetadata) => void;
+    refreshForMutationMetadata: (metadata: MutationMetadata) => void;
     removeTask: (id: string) => void;
+    markTaskTombstone: (id: string, source?: EntityTombstone['source'], operationId?: string) => void;
+    clearTaskTombstone: (id: string) => void;
+    registerTaskConflict: (id: string, message: string, generation?: number, remoteEntity?: PersistedTaskState, remoteRevision?: number, remoteAvailability?: MutationRemoteAvailability) => void;
+    resolveTaskConflict: (id: string, resolution: 'remote' | 'local' | 'dismiss') => Promise<void>;
     updateViewport: (updates: Partial<Viewport>) => void;
     setRowHeight: (height: number) => void;
     setViewMode: (mode: ViewMode) => void;
@@ -165,11 +317,13 @@ interface TaskState {
     setSelectedAssigneeIds: (ids: (number | null)[]) => void;
     setSelectedProjectIds: (ids: string[]) => void;
     setSelectedVersionIds: (ids: string[]) => void;
+    setSelectedTrackerIds: (ids: number[]) => void;
     setMemberProjectsOnly: (enabled: boolean) => Promise<void>;
     scrollToTask: (taskId: string) => void;
     focusTask: (taskId: string) => { status: 'ok' | 'filtered_out' | 'missing' };
     setSortConfig: (key: string | null) => void;
-    refreshData: () => Promise<void>;
+    refreshData: () => Promise<ReadApplyOutcome>;
+    loadInitialData: (params: InitialDataParams) => Promise<void>;
     loadSavedQueries: (force?: boolean) => Promise<void>;
     applySavedQuery: (queryId: number) => Promise<void>;
     clearSavedQuery: () => Promise<void>;
@@ -184,9 +338,11 @@ interface TaskState {
 
 const preferences = loadPreferences();
 const initialUrlState = readIssueQueryParamsFromUrl();
+const oneYearAgo = new Date();
+oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
 const DEFAULT_VIEWPORT: Viewport = {
-    startDate: preferences.viewport?.startDate ?? new Date().setFullYear(new Date().getFullYear() - 1),
+    startDate: preferences.viewport?.startDate ?? toTimelineDate(fromLocalDate(oneYearAgo)),
     scrollX: preferences.viewport?.scrollX ?? 0,
     scrollY: preferences.viewport?.scrollY ?? 0,
     scale: preferences.viewport?.scale ?? preferences.customScales?.[preferences.zoomLevel ?? 1] ?? ZOOM_SCALES[preferences.zoomLevel ?? 1],
@@ -215,6 +371,9 @@ const standaloneOverridesFromState = (state: TaskState): QueryOverrides => ({
         : { mode: 'all' },
     version: state.selectedVersionIds.length > 0
         ? { mode: 'subset', values: [...state.selectedVersionIds] }
+        : { mode: 'all' },
+    tracker: state.selectedTrackerIds.length > 0
+        ? { mode: 'subset', values: [...state.selectedTrackerIds] }
         : { mode: 'all' }
 });
 
@@ -238,6 +397,7 @@ const resolveLayoutState = (state: LayoutState, overrides: Partial<LayoutState> 
     versionExpansion: overrides.versionExpansion ?? state.versionExpansion,
     taskExpansion: overrides.taskExpansion ?? state.taskExpansion,
     selectedVersionIds: overrides.selectedVersionIds ?? state.selectedVersionIds,
+    selectedTrackerIds: overrides.selectedTrackerIds ?? state.selectedTrackerIds,
     selectedProjectIds: overrides.selectedProjectIds ?? state.selectedProjectIds,
     sortConfig: overrides.sortConfig ?? state.sortConfig,
     customFields: overrides.customFields ?? state.customFields,
@@ -255,6 +415,7 @@ const buildLayoutFromState = (state: LayoutState, overrides: Partial<LayoutState
         layoutState.selectedAssigneeIds,
         layoutState.selectedProjectIds,
         layoutState.selectedVersionIds,
+        layoutState.selectedTrackerIds,
         layoutState.showSubprojects,
         layoutState.currentProjectId
     );
@@ -280,6 +441,8 @@ const buildLayoutFromState = (state: LayoutState, overrides: Partial<LayoutState
 };
 
 const buildDerivedSchedulingSummary = (tasks: Task[], relations: Relation[]): DerivedSchedulingSummary => {
+    derivedRecalculationCounters.scheduling += 1;
+    derivedRecalculationCounters.criticalPath += 1;
     const criticalPath = TaskLogicService.calculateCriticalPath(tasks, relations);
 
     return {
@@ -289,14 +452,38 @@ const buildDerivedSchedulingSummary = (tasks: Task[], relations: Relation[]): De
     };
 };
 
+export const derivedRecalculationCounters = {
+    scheduling: 0,
+    criticalPath: 0,
+    layout: 0
+};
+
+export const resetDerivedRecalculationCounters = () => {
+    derivedRecalculationCounters.scheduling = 0;
+    derivedRecalculationCounters.criticalPath = 0;
+    derivedRecalculationCounters.layout = 0;
+};
+
 const buildDerivedTaskState = (
     state: TaskState,
-    overrides: Partial<LayoutState> & { allTasks?: Task[]; relations?: Relation[] } = {}
+    overrides: Partial<LayoutState> & {
+        allTasks?: Task[];
+        relations?: Relation[];
+        derivedInvalidation?: DerivedInvalidation;
+        schedulingSummary?: DerivedSchedulingSummary;
+    } = {}
 ): DerivedTaskState => {
     const allTasks = overrides.allTasks ?? state.allTasks;
     const relations = overrides.relations ?? state.relations;
+    derivedRecalculationCounters.layout += 1;
     const layout = buildLayoutFromState(state, { ...overrides, allTasks, relations });
-    const schedulingSummary = buildDerivedSchedulingSummary(allTasks, relations);
+    const schedulingSummary = overrides.schedulingSummary ?? (overrides.derivedInvalidation === 'none' || overrides.derivedInvalidation === 'layout'
+        ? {
+            schedulingStates: state.schedulingStates,
+            criticalPathMetrics: state.criticalPathMetrics,
+            criticalPathProjectFinish: state.criticalPathProjectFinish
+        }
+        : buildDerivedSchedulingSummary(allTasks, relations));
 
     return {
         tasks: layout.tasks,
@@ -375,14 +562,33 @@ type ApiDataPatchResult = {
     querySyncState: SharedQuerySyncState;
 };
 
-const buildApiDataPatch = (data: ApiData, state: TaskState): ApiDataPatchResult => {
+const buildApiDataPatch = (data: ApiData, state: TaskState, readContext?: ReadContext): ApiDataPatchResult => {
     const filterOptions = data.filterOptions ?? EMPTY_FILTER_OPTIONS;
     const customFields = data.customFields ?? [];
     const versions = data.versions ?? [];
     const relations = data.relations ?? [];
-    const tasks = data.tasks ?? [];
+    const serverTasks = (data.tasks ?? []).filter(task => !state.taskTombstones[task.id]);
+    const mergedServerTasks = serverTasks.map((task) => {
+        const patches = state.localTaskPatches[task.id] ?? [];
+        return patches.length > 0 ? applyLocalPatches(task, patches) : task;
+    });
+    const serverTaskIds = new Set(serverTasks.map((task) => task.id));
+    const preservesDirtyScope = !readContext || !state.activeReadContext || (
+        state.activeReadContext.projectId === readContext.projectId &&
+        state.activeReadContext.queryIdentity === readContext.queryIdentity &&
+        state.activeReadContext.scopeIdentity === readContext.scopeIdentity
+    );
+    const tasks = [
+        ...mergedServerTasks,
+        ...(preservesDirtyScope
+            ? state.allTasks.filter((task) => state.modifiedTaskIds.has(task.id) && !serverTaskIds.has(task.id) && !state.taskTombstones[task.id])
+            : [])
+    ];
     const nextResolved: ResolvedQueryState = {
         ...(data.initialState ?? toResolvedQueryStateFromStore(state)),
+        ...(state.explicitGroupByOverride !== undefined
+            ? { groupBy: state.explicitGroupByOverride }
+            : {}),
         // A Saved Query can define Redmine's project_id filter, but it must not
         // replace the independent Canvas project scope.
         ...(state.projectSelectionExplicit
@@ -416,6 +622,7 @@ const buildApiDataPatch = (data: ApiData, state: TaskState): ApiDataPatchResult 
         selectedAssigneeIds: queryState.selectedAssigneeIds,
         selectedProjectIds: queryState.selectedProjectIds,
         selectedVersionIds: queryState.selectedVersionIds,
+        selectedTrackerIds: queryState.selectedTrackerIds,
         projectExpansion,
         versionExpansion,
         taskExpansion
@@ -428,6 +635,7 @@ const buildApiDataPatch = (data: ApiData, state: TaskState): ApiDataPatchResult 
         selectedProjectIds: queryState.selectedProjectIds,
         projectSelectionExplicit: state.projectSelectionExplicit || nextResolved.canvasProjectIds !== undefined,
         selectedVersionIds: queryState.selectedVersionIds,
+        selectedTrackerIds: queryState.selectedTrackerIds,
         memberProjectsOnly: queryState.memberProjectsOnly,
         sortConfig,
         groupByProject: queryState.groupByProject,
@@ -457,7 +665,12 @@ const buildApiDataPatch = (data: ApiData, state: TaskState): ApiDataPatchResult 
             projectExpansion,
             versionExpansion,
             taskExpansion,
-            modifiedTaskIds: new Set<string>(),
+            modifiedTaskIds: new Set(state.modifiedTaskIds),
+            serverTaskSnapshot: replaceServerSnapshot(
+                state.serverTaskSnapshot,
+                serverTasks,
+                readContext ?? state.activeReadContext
+            ),
             ...toDerivedTaskStatePatch(derived)
         }
     };
@@ -468,42 +681,209 @@ type ParentMoveStoreState = LayoutState & {
     layoutRows: LayoutRow[];
     rowCount: number;
     modifiedTaskIds: Set<string>;
+    editGenerations: Record<string, number>;
     autoSave: boolean;
+    localTaskPatches: Record<string, Array<LocalPatch<Task>>>;
+    serverTaskSnapshot: ServerSnapshot<Task>;
 };
 
 const buildParentMoveOptimisticPatch = (state: ParentMoveStoreState, nextAllTasks: Task[]) => {
     const layout = buildLayoutFromState(state, { allTasks: nextAllTasks });
+    const sourceTaskId = nextAllTasks.find((task, index) => task.parentId !== state.allTasks[index]?.parentId || task.displayOrder !== state.allTasks[index]?.displayOrder)?.id;
+    const sourceBefore = sourceTaskId ? state.allTasks.find(task => task.id === sourceTaskId) : undefined;
+    const sourceAfter = sourceTaskId ? nextAllTasks.find(task => task.id === sourceTaskId) : undefined;
+    const fields: Partial<Task> = {};
+    if (sourceBefore && sourceAfter && sourceBefore.parentId !== sourceAfter.parentId) {
+        fields.parentId = sourceAfter.parentId;
+    }
+    const hasPersistedFields = Object.keys(fields).length > 0;
+    const editGenerations = sourceTaskId && hasPersistedFields
+        ? { ...state.editGenerations, [sourceTaskId]: (state.editGenerations[sourceTaskId] ?? 0) + 1 }
+        : state.editGenerations;
+    const localTaskPatches = { ...state.localTaskPatches };
+    const modifiedTaskIds = new Set(state.modifiedTaskIds);
+    if (sourceTaskId && sourceBefore && sourceAfter && hasPersistedFields) {
+        const generation = editGenerations[sourceTaskId] ?? 0;
+        localTaskPatches[sourceTaskId] = [
+            ...(localTaskPatches[sourceTaskId] ?? []),
+            {
+                entityId: sourceTaskId,
+                projection: fields,
+                mutationIntent: fields,
+                generation,
+                operationId: `parent-move:${sourceTaskId}:${generation}`
+            }
+        ];
+        modifiedTaskIds.add(sourceTaskId);
+    }
     return {
         allTasks: nextAllTasks,
         tasks: layout.tasks,
         layoutRows: layout.layoutRows,
-        rowCount: layout.rowCount
+        rowCount: layout.rowCount,
+        editGenerations,
+        localTaskPatches,
+        modifiedTaskIds
     };
 };
 
-const buildParentMoveSuccessPatch = (state: ParentMoveStoreState, sourceBefore: Task, result: { lockVersion?: number }) => {
+const buildParentMoveSuccessPatch = (state: ParentMoveStoreState, sourceBefore: Task, result: { lockVersion?: number; parentId?: string }, operationGeneration: number) => {
     const sourceTaskId = sourceBefore.id;
+    const currentSource = state.allTasks.find((task) => task.id === sourceTaskId);
+    const responseParentId = result.parentId;
+    const operationId = `parent-move:${sourceTaskId}:${operationGeneration}`;
+    const operationPatch = (state.localTaskPatches[sourceTaskId] ?? []).find(patch => patch.operationId === operationId);
     const updatedAllTasks = state.allTasks.map((task) => (
         task.id === sourceTaskId
-            ? { ...task, lockVersion: result.lockVersion ?? task.lockVersion }
+            ? { ...task, lockVersion: Math.max(task.lockVersion, result.lockVersion ?? task.lockVersion) }
             : task
     ));
     const layout = buildLayoutFromState(state, { allTasks: updatedAllTasks });
     const nextModified = new Set(state.modifiedTaskIds);
-    nextModified.delete(sourceTaskId);
+    const localTaskPatches = { ...state.localTaskPatches };
+    if (operationPatch) {
+        localTaskPatches[sourceTaskId] = (localTaskPatches[sourceTaskId] ?? []).filter(patch => patch.operationId !== operationId);
+        if (localTaskPatches[sourceTaskId].length === 0) {
+            delete localTaskPatches[sourceTaskId];
+        }
+        if (!hasLocalMutationIntent(localTaskPatches[sourceTaskId])) nextModified.delete(sourceTaskId);
+    } else if (!currentSource || responseParentId === undefined || currentSource.parentId === responseParentId) {
+        nextModified.delete(sourceTaskId);
+    }
+    const serverTask = state.serverTaskSnapshot.entitiesById[sourceTaskId] ?? sourceBefore;
+    const nextServerTask = operationPatch
+        ? { ...serverTask, ...operationPatch.mutationIntent, lockVersion: Math.max(serverTask.lockVersion, result.lockVersion ?? serverTask.lockVersion) }
+        : { ...serverTask, lockVersion: Math.max(serverTask.lockVersion, result.lockVersion ?? serverTask.lockVersion) };
 
     return {
         allTasks: updatedAllTasks,
         tasks: layout.tasks,
         layoutRows: layout.layoutRows,
         rowCount: layout.rowCount,
-        modifiedTaskIds: nextModified
+        modifiedTaskIds: nextModified,
+        localTaskPatches,
+        serverTaskSnapshot: {
+            ...state.serverTaskSnapshot,
+            entitiesById: { ...state.serverTaskSnapshot.entitiesById, [sourceTaskId]: nextServerTask },
+            revisions: {
+                ...state.serverTaskSnapshot.revisions,
+                [sourceTaskId]: Math.max(state.serverTaskSnapshot.revisions[sourceTaskId] ?? 0, nextServerTask.lockVersion)
+            }
+        }
     };
 };
 
 const buildParentMoveFailure = (error?: string) => buildMoveTaskResult('error', {
     error: error || (i18n.t('label_parent_drop_failed') || 'Failed to update parent')
 });
+
+const resolveCascadingScheduleUpdates = (
+    tasks: Task[],
+    relations: Relation[],
+    seedTaskIds: Iterable<string>,
+    propagateDependencies = true
+): { tasks: Task[]; updates: Map<string, Partial<Task>>; error?: string } => {
+    let workingTasks = tasks;
+    const updates = new Map<string, Partial<Task>>();
+    const affectedTaskIds = new Set(seedTaskIds);
+    let frontier = new Set(affectedTaskIds);
+    const maxPasses = Math.max(1, tasks.length * 2);
+
+    const applyUpdates = (nextUpdates: Map<string, Partial<Task>>): Set<string> => {
+        const changedIds = new Set<string>();
+        nextUpdates.forEach((patch, taskId) => {
+            const task = workingTasks.find((candidate) => candidate.id === taskId);
+            if (!task) return;
+            const nextTask = { ...task, ...patch };
+            if (nextTask.startDate === task.startDate && nextTask.dueDate === task.dueDate) return;
+            workingTasks = workingTasks.map((candidate) => candidate.id === taskId ? nextTask : candidate);
+            updates.set(taskId, { ...updates.get(taskId), ...patch });
+            affectedTaskIds.add(taskId);
+            changedIds.add(taskId);
+        });
+        return changedIds;
+    };
+
+    for (let pass = 0; pass < maxPasses && frontier.size > 0; pass += 1) {
+        const changedIds = new Set<string>();
+
+        for (const taskId of frontier) {
+            const task = workingTasks.find((candidate) => candidate.id === taskId);
+            if (!task?.parentId) continue;
+            applyUpdates(TaskLogicService.recalculateParentDates(workingTasks, task.parentId))
+                .forEach((changedId) => changedIds.add(changedId));
+        }
+
+        const dependencySeeds = propagateDependencies
+            ? new Set([...frontier, ...changedIds])
+            : new Set<string>();
+        for (const taskId of dependencySeeds) {
+            const task = workingTasks.find((candidate) => candidate.id === taskId);
+            if (!task || !Number.isFinite(task.startDate) || !Number.isFinite(task.dueDate)) continue;
+            const result = TaskLogicService.checkDependencies(
+                workingTasks,
+                relations,
+                taskId,
+                task.startDate!,
+                task.dueDate!,
+                AutoScheduleMoveMode.ConstraintPush
+            );
+            if (result.error) return { tasks, updates: new Map(), error: result.error };
+            applyUpdates(result.updates).forEach((changedId) => changedIds.add(changedId));
+        }
+
+        frontier = changedIds;
+    }
+
+    const nonEditableTask = [...affectedTaskIds]
+        .map((taskId) => workingTasks.find((task) => task.id === taskId))
+        .find((task) => task && !TaskLogicService.canEditTask(task));
+    if (nonEditableTask) {
+        return {
+            tasks,
+            updates: new Map(),
+            error: i18n.t('label_auto_schedule_permission_denied') ||
+                'A linked task cannot be moved because you do not have permission to edit it.'
+        };
+    }
+
+    return { tasks: workingTasks, updates };
+};
+
+const hasOwnField = (value: object, field: string): boolean => (
+    Object.prototype.hasOwnProperty.call(value, field)
+);
+
+const normalizeTaskDateUpdates = (task: Task, updates: Partial<Task>): Partial<Task> => {
+    if (!hasOwnField(updates, 'startDate') && !hasOwnField(updates, 'dueDate')) return updates;
+
+    const nextUpdates = { ...updates };
+    const normalized = normalizeTaskDateInterval(
+        {
+            startDate: hasOwnField(updates, 'startDate') ? updates.startDate : task.startDate,
+            dueDate: hasOwnField(updates, 'dueDate') ? updates.dueDate : task.dueDate
+        },
+        {
+            changedFields: {
+                startDate: hasOwnField(updates, 'startDate'),
+                dueDate: hasOwnField(updates, 'dueDate')
+            },
+            projectId: updates.projectId ?? task.projectId,
+            mode: 'legacy_unspecified'
+        }
+    );
+    if (!normalized.valid) return { ...nextUpdates, startDate: task.startDate, dueDate: task.dueDate };
+    const nextStart = normalized.interval.startDate;
+    const nextDue = normalized.interval.dueDate;
+
+    if (hasOwnField(updates, 'startDate') || nextStart !== task.startDate) {
+        nextUpdates.startDate = nextStart ?? undefined;
+    }
+    if (hasOwnField(updates, 'dueDate') || nextDue !== task.dueDate) {
+        nextUpdates.dueDate = nextDue ?? undefined;
+    }
+    return nextUpdates;
+};
 
 const buildRelationChange = (state: TaskState, relation: Relation, nextRelations: Relation[]) => {
     let nextTasks = state.allTasks;
@@ -522,24 +902,61 @@ const buildRelationChange = (state: TaskState, relation: Relation, nextRelations
         nextTasks = nextTasks.map((task) => dependentUpdates.updates.has(task.id) ? { ...task, ...dependentUpdates.updates.get(task.id) } : task);
     }
 
+    const cascadingUpdates = resolveCascadingScheduleUpdates(
+        nextTasks,
+        nextRelations,
+        [originTaskId, ...dependentUpdates.updates.keys()]
+    );
+    if (cascadingUpdates.error) {
+        useUIStore.getState().addNotification(cascadingUpdates.error, 'error');
+        nextTasks = state.allTasks;
+        dependentUpdates.updates.clear();
+    } else {
+        nextTasks = cascadingUpdates.tasks;
+        cascadingUpdates.updates.forEach((patch, taskId) => dependentUpdates.updates.set(taskId, patch));
+    }
+
     const modifiedTaskIds = new Set(state.modifiedTaskIds);
-    dependentUpdates.updates.forEach((_, taskId) => modifiedTaskIds.add(taskId));
+    const editGenerations = { ...state.editGenerations };
+    const localTaskPatches = { ...state.localTaskPatches };
+    dependentUpdates.updates.forEach((fields, taskId) => {
+        const meaningfulFields = Object.fromEntries(
+            Object.entries(fields).filter(([key]) => key !== 'lockVersion' && key !== 'id')
+        ) as Partial<Task>;
+        if (Object.keys(meaningfulFields).length === 0) return;
+        const generation = (editGenerations[taskId] ?? 0) + 1;
+        editGenerations[taskId] = generation;
+        modifiedTaskIds.add(taskId);
+        const operationId = `relation-cascade:${relation.id || 'new'}:${taskId}:${generation}`;
+        localTaskPatches[taskId] = [
+            ...(localTaskPatches[taskId] ?? []).filter(patch => patch.operationId !== operationId),
+            {
+                entityId: taskId,
+                projection: meaningfulFields,
+                mutationIntent: meaningfulFields,
+                generation,
+                operationId
+            }
+        ];
+    });
 
     return {
         nextTasks,
         modifiedTaskIds,
+        editGenerations,
+        localTaskPatches,
         derived: buildDerivedTaskState(state, { relations: nextRelations, allTasks: nextTasks })
     };
 };
 
 const getTaskFocusTimestamp = (task: Task): number => {
     if (Number.isFinite(task.startDate)) {
-        return task.startDate!;
+        return toTimelineDate(toCalendarDate(task.startDate!));
     }
     if (Number.isFinite(task.dueDate)) {
-        return task.dueDate!;
+        return toTimelineDate(toCalendarDate(task.dueDate!));
     }
-    return Date.now();
+    return toTimelineDate(todayCalendarDate());
 };
 
 const matchesTaskFilters = (task: Task, state: TaskState): boolean => {
@@ -548,9 +965,10 @@ const matchesTaskFilters = (task: Task, state: TaskState): boolean => {
     const hasAssigneeFilter = state.selectedAssigneeIds.length > 0;
     const hasProjectFilter = state.selectedProjectIds.length > 0;
     const hasVersionFilter = state.selectedVersionIds.length > 0;
+    const hasTrackerFilter = state.selectedTrackerIds.length > 0;
     const hasSubprojectFilter = !state.showSubprojects && state.currentProjectId !== null && !hasProjectFilter;
 
-    if (!hasTextFilter && !hasAssigneeFilter && !hasProjectFilter && !hasVersionFilter && !hasSubprojectFilter) {
+    if (!hasTextFilter && !hasAssigneeFilter && !hasProjectFilter && !hasVersionFilter && !hasTrackerFilter && !hasSubprojectFilter) {
         return true;
     }
 
@@ -564,37 +982,96 @@ const matchesTaskFilters = (task: Task, state: TaskState): boolean => {
             (state.selectedVersionIds.includes('_none') && !task.fixedVersionId) ||
             (task.fixedVersionId !== undefined && state.selectedVersionIds.includes(task.fixedVersionId))
         )) &&
+        (!hasTrackerFilter || (task.trackerId !== undefined && state.selectedTrackerIds.includes(task.trackerId))) &&
         (!hasSubprojectFilter || task.projectId === state.currentProjectId)
     );
 };
 
-const computeFocusedViewport = (state: TaskState, task: Task) => {
-    const BOTTOM_PADDING_PX = 40;
-    const targetMetadata = getTaskFocusTimestamp(task);
-    let startDate = state.viewport.startDate;
-
-    if (targetMetadata < startDate) {
-        const ONE_WEEK = 7 * 24 * 60 * 60 * 1000;
-        startDate = targetMetadata - ONE_WEEK;
-    }
-
-    const taskX = (targetMetadata - startDate) * state.viewport.scale;
-    const scrollX = Math.max(0, taskX - (state.viewport.width / 2));
-
-    const rawScrollY = task.rowIndex * state.viewport.rowHeight - ((state.viewport.height - state.viewport.rowHeight) / 2);
-    const maxScrollY = Math.max(0, state.rowCount * state.viewport.rowHeight + BOTTOM_PADDING_PX - state.viewport.height);
-    const scrollY = Math.max(0, Math.min(maxScrollY, rawScrollY));
-
-    return {
-        ...state.viewport,
-        startDate,
-        scrollX,
-        scrollY
+export const useTaskStore = create<TaskState>((set, get) => {
+    const inflightReads = new Map<string, Promise<ReadApplyOutcome>>();
+    let auxiliaryReadContext: ReadContext | null = null;
+    let auxiliaryReadGeneration = 0;
+    let mutationResyncGeneration = 0;
+    let activeReadContext: ReadContext | null = null;
+    const requestAndApplyData = async (
+        fetchData: () => Promise<ApiData>,
+        context: ReadContext
+    ): Promise<ReadApplyOutcome> => {
+        const readKey = context.contextId;
+        const existing = inflightReads.get(readKey);
+        if (existing) return existing;
+        activeReadContext = context;
+        readLifecycleMetrics.requestsStarted += 1;
+        readLifecycleMetrics.maxInflight = Math.max(readLifecycleMetrics.maxInflight, inflightReads.size + 1);
+        const request = (async (): Promise<ReadApplyOutcome> => {
+        try {
+            const data = await fetchData();
+            if (context.generation !== dataRequestGeneration || !canApplyReadResponse(activeReadContext, context)) {
+                readLifecycleMetrics.staleResponsesRejected += 1;
+                return { status: 'superseded', context };
+            }
+            get().applyApiData(data, context);
+            readLifecycleMetrics.responsesApplied += 1;
+            return { status: 'applied', context };
+        } catch (error) {
+            // A superseded request must not surface as a user-visible failure.
+            if (context.generation !== dataRequestGeneration || !canApplyReadResponse(activeReadContext, context)) {
+                readLifecycleMetrics.staleResponsesRejected += 1;
+                return { status: 'superseded', context };
+            }
+            readLifecycleMetrics.failures += 1;
+            throw error;
+        }
+        })();
+        inflightReads.set(readKey, request);
+        try {
+            return await request;
+        } finally {
+            if (inflightReads.get(readKey) === request) inflightReads.delete(readKey);
+        }
     };
-};
+    const refreshCurrentData = async (purpose: 'refresh' | 'saved_query'): Promise<ReadApplyOutcome> => {
+        const state = get();
+        const query = toResolvedQueryStateFromStore(state);
+        const scope = { showSubprojects: state.showSubprojects, memberProjectsOnly: state.memberProjectsOnly };
+        const generation = ++dataRequestGeneration;
+        const context = createReadContext({
+            generation,
+            projectId: state.currentProjectId,
+            query,
+            scope,
+            purpose
+        });
+        return requestAndApplyData(() => apiClient.fetchData({ query, queryContext: state.queryContext }), context);
+    };
+    const fetchMutationResyncData = async (params: { query?: { selectedStatusIds?: number[] } }): Promise<ApiData> => {
+        const state = get();
+        const generation = ++dataRequestGeneration;
+        const resyncGeneration = ++mutationResyncGeneration;
+        readLifecycleMetrics.requestsStarted += 1;
+        readLifecycleMetrics.maxInflight = Math.max(readLifecycleMetrics.maxInflight, 1);
+        const query = {
+            ...toResolvedQueryStateFromStore(state),
+            ...(params.query?.selectedStatusIds ? { selectedStatusIds: params.query.selectedStatusIds } : {})
+        };
+        const context = createReadContext({
+            generation,
+            projectId: state.currentProjectId,
+            query,
+            scope: { showSubprojects: state.showSubprojects, memberProjectsOnly: state.memberProjectsOnly },
+            purpose: 'mutation_resync',
+            mergePolicy: 'preserve_dirty'
+        });
+        activeReadContext = context;
+        const data = await apiClient.fetchData({ query, queryContext: state.queryContext });
+        if (resyncGeneration !== mutationResyncGeneration || !canApplyReadResponse(activeReadContext, context)) {
+            readLifecycleMetrics.staleResponsesRejected += 1;
+            throw new Error('Superseded mutation resync');
+        }
+        return data;
+    };
 
-
-export const useTaskStore = create<TaskState>((set, get) => ({
+    return ({
     allTasks: [],
     tasks: [],
     relations: [],
@@ -637,6 +1114,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     selectedProjectIds: [],
     projectSelectionExplicit: false,
     selectedVersionIds: [],
+    selectedTrackerIds: [],
     memberProjectsOnly: preferences.memberProjectsOnly ?? false,
     sortConfig: { key: 'startDate', direction: 'asc' },
     customScales: preferences.customScales ?? {},
@@ -644,20 +1122,29 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     showSubprojects: true,
     isSortingSuspended: false,
     modifiedTaskIds: new Set(),
+    editGenerations: {},
     autoSave: preferences.autoSave ?? false,
     initialDataLoaded: false,
+    activeReadContext: null,
+    serverTaskSnapshot: createServerSnapshot<Task>([]),
+    localTaskPatches: {},
+    taskTombstones: {},
+    taskConflicts: {},
+    barOperations: {},
+    activeBarOperationId: null,
 
     setAutoSave: (enabled) => set({ autoSave: enabled }),
 
     setTasks: (tasks) => set((state) => {
-        const { projectExpansion, taskExpansion, versionExpansion } = initializeExpansionMaps(tasks, {
+        const effectiveTasks = tasks.filter(task => !state.taskTombstones[task.id]);
+        const { projectExpansion, taskExpansion, versionExpansion } = initializeExpansionMaps(effectiveTasks, {
             projectExpansion: state.projectExpansion,
             versionExpansion: state.versionExpansion,
             taskExpansion: state.taskExpansion
         });
 
         const derived = buildDerivedTaskState(state, {
-            allTasks: tasks,
+            allTasks: effectiveTasks,
             projectExpansion,
             versionExpansion,
             taskExpansion
@@ -730,6 +1217,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         const selectedAssigneeIds = queryState.selectedAssigneeIds;
         const selectedProjectIds = queryState.selectedProjectIds;
         const selectedVersionIds = queryState.selectedVersionIds;
+        const selectedTrackerIds = queryState.selectedTrackerIds;
         const memberProjectsOnly = queryState.memberProjectsOnly;
         const activeQueryId = queryState.queryId;
         const layout = buildLayoutFromState(state, {
@@ -739,7 +1227,8 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             sortConfig,
             selectedAssigneeIds,
             selectedProjectIds,
-            selectedVersionIds
+            selectedVersionIds,
+            selectedTrackerIds
         });
 
         const nextState = {
@@ -752,6 +1241,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
                 || resolved?.selectedProjectIds !== undefined
                 || state.projectSelectionExplicit,
             selectedVersionIds,
+            selectedTrackerIds,
             groupByProject,
             groupByAssignee,
             showSubprojects,
@@ -764,16 +1254,18 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         syncSharedQueryState(nextState);
         return nextState;
     }),
-    applyApiData: (data) => {
+    applyApiData: (data, readContext) => {
+        const businessCalendar = configureBusinessCalendar(data.businessCalendar);
         let querySyncState: SharedQuerySyncState | null = null;
         set((state) => {
-            const result = buildApiDataPatch(data, state);
+            const result = buildApiDataPatch(data, state, readContext);
             querySyncState = result.querySyncState;
-            return result.patch;
+            return { ...result.patch, activeReadContext: readContext ?? activeReadContext };
         });
-        if (data.initialState?.visibleColumns?.length) {
+        const isQueryBoundary = readContext?.purpose === 'initial_load' || readContext?.purpose === 'saved_query';
+        if (data.initialState?.visibleColumns?.length && (isQueryBoundary || useUIStore.getState().columnStateSource !== 'user')) {
             useUIStore.getState().applyQueryVisibleColumns(data.initialState.visibleColumns);
-        } else if (useUIStore.getState().columnStateSource === 'query') {
+        } else if (isQueryBoundary && useUIStore.getState().columnStateSource === 'query') {
             useUIStore.getState().restorePreferenceColumns();
         }
         const nextQuerySyncState = querySyncState as SharedQuerySyncState | null;
@@ -789,6 +1281,13 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         (data.warnings ?? []).forEach((warning) => {
             useUIStore.getState().addNotification(warning, 'warning');
         });
+        if (businessCalendar.status === 'error') {
+            useUIStore.getState().addNotification(
+                i18n.t('error_canvas_gantt_business_calendar_invalid') ||
+                    "Business calendar configuration is invalid. Redmine's non-working weekdays are being used as a fallback.",
+                'warning'
+            );
+        }
     },
     setCustomFields: (customFields) => set((state) => {
         const derived = buildDerivedTaskState(state, { customFields });
@@ -798,6 +1297,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         };
     }),
     setSelectedStatusFromServer: (ids) => {
+        invalidateDataRequests();
         const queryContext = setStatusOverride(get().queryContext, ids.length > 0
             ? { mode: 'subset', values: ids }
             : { mode: 'all' });
@@ -819,38 +1319,53 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     addRelation: (relation) => set((state) => {
         const exists = state.relations.some(r => r.from === relation.from && r.to === relation.to && r.type === relation.type);
         if (exists) return state;
+        invalidateDataRequests();
         const nextRelations = [...state.relations, relation];
-        const { nextTasks, modifiedTaskIds, derived } = buildRelationChange(state, relation, nextRelations);
+        const { nextTasks, modifiedTaskIds, editGenerations, localTaskPatches, derived } = buildRelationChange(state, relation, nextRelations);
         return {
             allTasks: nextTasks,
             relations: nextRelations,
             draftRelation: null,
             ...toDerivedTaskStatePatch(derived),
-            modifiedTaskIds
+            modifiedTaskIds,
+            editGenerations,
+            localTaskPatches
         };
     }),
     replaceRelation: (relation) => set((state) => {
+        invalidateDataRequests();
         const existingIndex = state.relations.findIndex(r => r.id === relation.id);
         const nextRelations =
             existingIndex === -1
                 ? [...state.relations, relation]
                 : state.relations.map((current) => current.id === relation.id ? relation : current);
-        const { nextTasks, modifiedTaskIds, derived } = buildRelationChange(state, relation, nextRelations);
+        const { nextTasks, modifiedTaskIds, editGenerations, localTaskPatches, derived } = buildRelationChange(state, relation, nextRelations);
         return {
             allTasks: nextTasks,
             relations: nextRelations,
             draftRelation: null,
             ...toDerivedTaskStatePatch(derived),
-            modifiedTaskIds
+            modifiedTaskIds,
+            editGenerations,
+            localTaskPatches
         };
     }),
     removeRelation: (relationId) => set((state) => {
         const nextRelations = state.relations.filter(r => r.id !== relationId);
-        const derived = buildDerivedTaskState(state, { relations: nextRelations });
+        if (nextRelations.length === state.relations.length) return state;
+        invalidateDataRequests();
+        const relation = state.relations.find(current => current.id === relationId);
+        const relationChange = relation
+            ? buildRelationChange(state, relation, nextRelations)
+            : { nextTasks: state.allTasks, modifiedTaskIds: state.modifiedTaskIds, editGenerations: state.editGenerations, localTaskPatches: state.localTaskPatches, derived: buildDerivedTaskState(state, { relations: nextRelations }) };
         return {
+            allTasks: relationChange.nextTasks,
             relations: nextRelations,
             selectedRelationId: state.selectedRelationId === relationId ? null : state.selectedRelationId,
-            ...toDerivedTaskStatePatch(derived)
+            ...toDerivedTaskStatePatch(relationChange.derived),
+            modifiedTaskIds: relationChange.modifiedTaskIds,
+            editGenerations: relationChange.editGenerations,
+            localTaskPatches: relationChange.localTaskPatches
         };
     }),
     selectTask: (id) => set({
@@ -900,6 +1415,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         const target = taskById.get(targetTaskId);
         if (!source || !target) return false;
         if (!source.editable) return false;
+        if (source.parentId === targetTaskId) return false;
         if (source.projectId && target.projectId && source.projectId !== target.projectId) return false;
         if (isDescendantTask(taskById, sourceTaskId, targetTaskId)) return false;
         return true;
@@ -916,13 +1432,27 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             return buildMoveTaskResult('error', { error: i18n.t('label_parent_drop_invalid_target') || 'Invalid drop target' });
         }
 
-        const { apiClient } = await import('../api/client');
+        invalidateDataRequests();
         return runParentMove({
             sourceTaskId,
             expectedParentId: targetTaskId,
             getState: () => get(),
             setState: (patch) => set(patch),
-            restoreSnapshot: (snapshot) => set(snapshot),
+            restoreSnapshot: (snapshot) => set((state) => {
+                const currentTask = state.allTasks.find((task) => task.id === sourceTaskId);
+                const snapshotTask = snapshot.allTasks.find((task) => task.id === sourceTaskId);
+                const lockVersion = Math.max(currentTask?.lockVersion ?? 0, snapshotTask?.lockVersion ?? 0);
+                return {
+                    ...snapshot,
+                    allTasks: snapshot.allTasks.map((task) => task.id === sourceTaskId ? { ...task, lockVersion } : task),
+                    tasks: snapshot.tasks.map((task) => task.id === sourceTaskId ? { ...task, lockVersion } : task)
+                };
+            }),
+            rollbackOperation: (operationGeneration, sourceBefore) => get().rollbackTaskOperation(
+                sourceTaskId,
+                operationGeneration,
+                { parentId: sourceBefore.parentId, displayOrder: sourceBefore.displayOrder }
+            ),
             buildNextOrder: (allTasks) => tailDisplayOrderForParent(allTasks, targetTaskId, sourceTaskId),
             buildNextAllTasks: (allTasks, movingTaskId, nextOrder) => allTasks.map((task) => (
                 task.id === movingTaskId
@@ -931,13 +1461,25 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             )),
             buildOptimisticPatch: buildParentMoveOptimisticPatch,
             buildSuccessPatch: buildParentMoveSuccessPatch,
-            updateTaskFields: (taskId, payload) => apiClient.updateTaskFields(taskId, {
-                parent_issue_id: Number(targetTaskId),
-                lock_version: payload.lock_version
-            }),
+            ownsOperation: (state, sourceBefore, operationGeneration) => hasLocalPatchOwnership(
+                state.localTaskPatches[sourceBefore.id],
+                sourceBefore.id,
+                operationGeneration
+            ),
+            updateTaskFields: (taskId, payload, lifecycle) => taskMutationService.updateTaskFields(
+                taskId,
+                () => ({
+                    parent_issue_id: Number(targetTaskId),
+                    lock_version: payload().lock_version
+                }),
+                lifecycle
+            ),
             validatePersistedResult: (result) => result.parentId === targetTaskId,
             missingSourceResult: buildParentMoveFailure(),
-            failedResult: buildParentMoveFailure
+            failedResult: buildParentMoveFailure,
+            onConflict: (taskId, message, operationGeneration, remoteEntity, remoteRevision) => get().registerTaskConflict(taskId, message, operationGeneration, remoteEntity, remoteRevision),
+            onNotFound: (taskId, _operationGeneration, operationId) => get().markTaskTombstone(taskId, 'server', operationId),
+            onMutationMetadata: (taskId, metadata) => get().applyTaskMutationMetadata(taskId, metadata)
         });
     },
     moveTaskToRoot: async (sourceTaskId) => {
@@ -945,13 +1487,27 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             return buildMoveTaskResult('error', { error: i18n.t('label_parent_drop_invalid_target') || 'Invalid drop target' });
         }
 
-        const { apiClient } = await import('../api/client');
+        invalidateDataRequests();
         return runParentMove({
             sourceTaskId,
             expectedParentId: undefined,
             getState: () => get(),
             setState: (patch) => set(patch),
-            restoreSnapshot: (snapshot) => set(snapshot),
+            restoreSnapshot: (snapshot) => set((state) => {
+                const currentTask = state.allTasks.find((task) => task.id === sourceTaskId);
+                const snapshotTask = snapshot.allTasks.find((task) => task.id === sourceTaskId);
+                const lockVersion = Math.max(currentTask?.lockVersion ?? 0, snapshotTask?.lockVersion ?? 0);
+                return {
+                    ...snapshot,
+                    allTasks: snapshot.allTasks.map((task) => task.id === sourceTaskId ? { ...task, lockVersion } : task),
+                    tasks: snapshot.tasks.map((task) => task.id === sourceTaskId ? { ...task, lockVersion } : task)
+                };
+            }),
+            rollbackOperation: (operationGeneration, sourceBefore) => get().rollbackTaskOperation(
+                sourceTaskId,
+                operationGeneration,
+                { parentId: sourceBefore.parentId, displayOrder: sourceBefore.displayOrder }
+            ),
             buildNextOrder: (allTasks, sourceBefore) => tailDisplayOrderForRoot(allTasks, sourceBefore),
             buildNextAllTasks: (allTasks, movingTaskId, nextOrder) => allTasks.map((task) => (
                 task.id === movingTaskId
@@ -960,17 +1516,101 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             )),
             buildOptimisticPatch: buildParentMoveOptimisticPatch,
             buildSuccessPatch: buildParentMoveSuccessPatch,
-            updateTaskFields: (taskId, payload) => apiClient.updateTaskFields(taskId, {
-                parent_issue_id: null,
-                lock_version: payload.lock_version
-            }),
+            ownsOperation: (state, sourceBefore, operationGeneration) => hasLocalPatchOwnership(
+                state.localTaskPatches[sourceBefore.id],
+                sourceBefore.id,
+                operationGeneration
+            ),
+            updateTaskFields: (taskId, payload, lifecycle) => taskMutationService.updateTaskFields(
+                taskId,
+                () => ({
+                    parent_issue_id: null,
+                    lock_version: payload().lock_version
+                }),
+                lifecycle
+            ),
             validatePersistedResult: (result) => result.parentId === undefined,
             missingSourceResult: buildParentMoveFailure(),
-            failedResult: buildParentMoveFailure
+            failedResult: buildParentMoveFailure,
+            onConflict: (taskId, message, operationGeneration, remoteEntity, remoteRevision) => get().registerTaskConflict(taskId, message, operationGeneration, remoteEntity, remoteRevision),
+            onNotFound: (taskId, _operationGeneration, operationId) => get().markTaskTombstone(taskId, 'server', operationId),
+            onMutationMetadata: (taskId, metadata) => get().applyTaskMutationMetadata(taskId, metadata)
         });
     },
 
-    updateTask: (id, updates) => set((state) => {
+    beginBarOperation: (seedTaskId) => {
+        const operationId = `bar:${++barOperationSequence}`;
+        set((state) => beginBarOperationState(
+            state.barOperations,
+            state.allTasks,
+            state.editGenerations,
+            operationId,
+            seedTaskId
+        ));
+        return operationId;
+    },
+
+    endBarOperation: (operationId) => set((state) => {
+        const transition = endBarOperationState(
+            state.barOperations,
+            state.activeBarOperationId,
+            state.allTasks,
+            state.editGenerations,
+            operationId
+        );
+        return transition.barOperations === state.barOperations && transition.activeBarOperationId === state.activeBarOperationId
+            ? state
+            : transition;
+    }),
+
+    completeBarOperationTask: (taskId, completedGeneration) => set((state) => {
+        if (completedGeneration === undefined) return state;
+        const settlement = settleBarOperationTaskOwnership(state.barOperations, state.activeBarOperationId, taskId, {
+            mode: 'exact',
+            generation: completedGeneration
+        });
+        return settlement.barOperations === state.barOperations && settlement.activeBarOperationId === state.activeBarOperationId
+            ? state
+            : settlement;
+    }),
+
+    settleBarOperationTask: (taskId, operationGeneration) => set((state) => {
+        if (operationGeneration === undefined) return state;
+        const settlement = settleBarOperationTaskOwnership(state.barOperations, state.activeBarOperationId, taskId, {
+            mode: 'exact',
+            generation: operationGeneration
+        });
+        return settlement.barOperations === state.barOperations && settlement.activeBarOperationId === state.activeBarOperationId
+            ? state
+            : settlement;
+    }),
+
+    settleBarOperationTaskThrough: (taskId, operationGeneration) => set((state) => {
+        const settlement = settleBarOperationTaskOwnership(state.barOperations, state.activeBarOperationId, taskId, {
+            mode: 'through',
+            generation: operationGeneration
+        });
+        return settlement.barOperations === state.barOperations && settlement.activeBarOperationId === state.activeBarOperationId
+            ? state
+            : settlement;
+    }),
+
+    rollbackBarOperation: (operationId) => set((state) => {
+        const rollback = buildBarOperationRollback(state, operationId);
+        if (!rollback) return state;
+        const schedulingSummary = buildDerivedSchedulingSummary(rollback.allTasks, state.relations);
+        const derived = buildDerivedTaskState(state, {
+            allTasks: rollback.allTasks,
+            derivedInvalidation: 'critical_path',
+            schedulingSummary
+        });
+        return {
+            ...rollback,
+            ...toDerivedTaskStatePatch(derived),
+        };
+    }),
+
+    updateTask: (id, updates, mutationIntent = updates) => set((state) => {
         const task = state.allTasks.find(t => t.id === id);
         if (!task) return state;
 
@@ -979,13 +1619,18 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             return state;
         }
 
-        const updatedTask = { ...task, ...updates };
+        invalidateDataRequests();
+
+        const canonicalUpdates = normalizeTaskDateUpdates(task, updates);
+        const canonicalMutationIntent = normalizeTaskDateUpdates(task, mutationIntent);
+        const updatedTask = { ...task, ...canonicalUpdates };
         TaskLogicService.validateDates(updatedTask).forEach(warn => console.warn(warn));
 
         let currentTasks = state.allTasks.map(t => t.id === id ? updatedTask : t);
         const pendingUpdates = new Map<string, Partial<Task>>();
+        const isContextChange = hasOwnField(canonicalUpdates, 'projectId') || hasOwnField(canonicalUpdates, 'trackerId');
 
-        if (updates.startDate !== undefined || updates.dueDate !== undefined) {
+        if (!isContextChange && (hasOwnField(canonicalUpdates, 'startDate') || hasOwnField(canonicalUpdates, 'dueDate'))) {
             const depResult = TaskLogicService.checkDependencies(
                 state.allTasks,
                 state.relations,
@@ -1010,17 +1655,20 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             });
         }
 
-        const tasksToCheckParents = [id, ...pendingUpdates.keys()];
-        const processedParents = new Set<string>();
-
-        tasksToCheckParents.forEach(taskId => {
-            const t = currentTasks.find(ct => ct.id === taskId);
-            if (t && t.parentId && !processedParents.has(t.parentId)) {
-                processedParents.add(t.parentId);
-                const parentUpdates = TaskLogicService.recalculateParentDates(currentTasks, t.parentId);
-                parentUpdates.forEach((v, k) => pendingUpdates.set(k, v));
+        if (!isContextChange) {
+            const cascadingUpdates = resolveCascadingScheduleUpdates(
+                currentTasks,
+                state.relations,
+                [id, ...pendingUpdates.keys()],
+                useUIStore.getState().autoScheduleMoveMode !== AutoScheduleMoveMode.Off
+            );
+            if (cascadingUpdates.error) {
+                useUIStore.getState().addNotification(cascadingUpdates.error, 'error');
+                return state;
             }
-        });
+            currentTasks = cascadingUpdates.tasks;
+            cascadingUpdates.updates.forEach((patch, taskId) => pendingUpdates.set(taskId, patch));
+        }
 
         const finalTasks = state.allTasks.map(t => {
             if (t.id === id) return updatedTask;
@@ -1028,14 +1676,57 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             return t;
         });
 
+        const barOperations = captureBarOperationBaselines(
+            state.barOperations,
+            state.allTasks,
+            state.editGenerations,
+            state.activeBarOperationId,
+            [id, ...pendingUpdates.keys()]
+        );
+
 
 
         // Add modified task IDs
         const newModifiedIds = new Set(state.modifiedTaskIds);
-        newModifiedIds.add(id);
-        pendingUpdates.forEach((_, key) => newModifiedIds.add(key));
+        const nextEditGenerations = { ...state.editGenerations };
+        [id, ...pendingUpdates.keys()].forEach((taskId) => {
+            nextEditGenerations[taskId] = (nextEditGenerations[taskId] ?? 0) + 1;
+        });
+        const nextLocalTaskPatches = { ...state.localTaskPatches };
+        const patchFor = (taskId: string, projectionFields: Partial<Task>, intentFields: Partial<Task>) => {
+            const projection = Object.fromEntries(
+                Object.entries(projectionFields).filter(([key]) => key !== 'lockVersion' && key !== 'id')
+            ) as Partial<Task>;
+            const persistenceIntent = Object.fromEntries(
+                Object.entries(intentFields).filter(([key]) => key !== 'lockVersion' && key !== 'id')
+            ) as Partial<Task>;
+            if (Object.keys(projection).length === 0 && Object.keys(persistenceIntent).length === 0) return;
+            const generation = nextEditGenerations[taskId] ?? 0;
+            const operationId = `edit:${taskId}:${generation}`;
+            nextLocalTaskPatches[taskId] = [
+                ...(nextLocalTaskPatches[taskId] ?? []).filter(patch => patch.operationId !== operationId),
+                { entityId: taskId, projection, mutationIntent: persistenceIntent, generation, operationId }
+            ];
+            if (Object.keys(persistenceIntent).length > 0) newModifiedIds.add(taskId);
+        };
+        patchFor(id, canonicalUpdates, canonicalMutationIntent);
+        pendingUpdates.forEach((fields, taskId) => patchFor(taskId, fields, fields));
 
-        const nextSchedulingSummary = buildDerivedSchedulingSummary(finalTasks, state.relations);
+        const changedFields = new Set([...Object.keys(canonicalUpdates), ...[...pendingUpdates.values()].flatMap(patch => Object.keys(patch))]);
+        const requiresLayout = ['projectId', 'assignedToId', 'fixedVersionId'].some(field => changedFields.has(field));
+        const hasSchedulingChanges = ['startDate', 'dueDate', 'parentId', 'displayOrder'].some(field => changedFields.has(field));
+        const derivedInvalidation: DerivedInvalidation = hasSchedulingChanges
+            ? 'critical_path'
+            : requiresLayout
+                ? 'layout'
+                : 'none';
+        const nextSchedulingSummary = hasSchedulingChanges
+            ? buildDerivedSchedulingSummary(finalTasks, state.relations)
+            : {
+                schedulingStates: state.schedulingStates,
+                criticalPathMetrics: state.criticalPathMetrics,
+                criticalPathProjectFinish: state.criticalPathProjectFinish
+            };
 
         if (state.isSortingSuspended) {
             // Just update the view 'tasks' without re-layout (preserving order)
@@ -1059,38 +1750,421 @@ export const useTaskStore = create<TaskState>((set, get) => ({
                 allTasks: finalTasks,
                 tasks: newViewTasks,
                 ...nextSchedulingSummary,
-                modifiedTaskIds: newModifiedIds // Add here for suspended case
+                modifiedTaskIds: newModifiedIds, // Add here for suspended case
+                editGenerations: nextEditGenerations,
+                localTaskPatches: nextLocalTaskPatches,
+                barOperations
             };
         }
 
-        const derived = buildDerivedTaskState(state, { allTasks: finalTasks });
+        if (!requiresLayout && !hasSchedulingChanges) {
+            const nextViewTasks = state.tasks.map(viewTask => {
+                const updated = finalTasks.find(task => task.id === viewTask.id);
+                return updated ? {
+                    ...updated,
+                    rowIndex: viewTask.rowIndex,
+                    indentLevel: viewTask.indentLevel,
+                    treeLevelGuides: viewTask.treeLevelGuides,
+                    isLastChild: viewTask.isLastChild,
+                    hasChildren: viewTask.hasChildren
+                } : viewTask;
+            });
+            return {
+                allTasks: finalTasks,
+                tasks: nextViewTasks,
+                modifiedTaskIds: newModifiedIds,
+                editGenerations: nextEditGenerations,
+                localTaskPatches: nextLocalTaskPatches,
+                barOperations
+            };
+        }
+
+        const derived = buildDerivedTaskState(state, {
+            allTasks: finalTasks,
+            derivedInvalidation,
+            schedulingSummary: nextSchedulingSummary
+        });
 
         return {
             allTasks: finalTasks,
             ...toDerivedTaskStatePatch(derived),
-            modifiedTaskIds: newModifiedIds // Add here for normal case
+            modifiedTaskIds: newModifiedIds, // Add here for normal case
+            editGenerations: nextEditGenerations,
+            localTaskPatches: nextLocalTaskPatches,
+            barOperations
         };
     }),
 
-
-
-    removeTask: (id) => set((state) => {
-        const finalTasks = state.allTasks.filter(t => t.id !== id);
-        const derived = buildDerivedTaskState(state, { allTasks: finalTasks });
+    setTaskLockVersion: (id, lockVersion) => set((state) => {
+        const currentLockVersion = state.allTasks.find(task => task.id === id)?.lockVersion ?? 0;
+        if (lockVersion < currentLockVersion) return state;
+        const allTasks = state.allTasks.map((task) => (
+            task.id === id ? { ...task, lockVersion } : task
+        ));
+        const tasks = state.tasks.map((task) => (
+            task.id === id ? { ...task, lockVersion } : task
+        ));
+        const serverEntity = state.serverTaskSnapshot.entitiesById[id];
         return {
-            allTasks: finalTasks,
-            ...toDerivedTaskStatePatch(derived)
+            allTasks,
+            tasks,
+            ...(serverEntity && lockVersion >= (state.serverTaskSnapshot.revisions[id] ?? 0)
+                ? {
+                    serverTaskSnapshot: {
+                        ...state.serverTaskSnapshot,
+                        entitiesById: {
+                            ...state.serverTaskSnapshot.entitiesById,
+                            [id]: { ...serverEntity, lockVersion }
+                        },
+                        revisions: { ...state.serverTaskSnapshot.revisions, [id]: lockVersion }
+                    }
+                }
+                : {})
         };
     }),
+
+    commitTaskOperation: (id, operationGeneration, lockVersion) => set((state) => {
+        const currentTask = state.allTasks.find(task => task.id === id);
+        if (!currentTask) return state;
+        const operationPatches = (state.localTaskPatches[id] ?? []).filter(patch => patch.generation === operationGeneration);
+        if (operationPatches.length === 0) return state;
+        const localTaskPatches = { ...state.localTaskPatches };
+        localTaskPatches[id] = (localTaskPatches[id] ?? []).filter(patch => patch.generation !== operationGeneration);
+        if (localTaskPatches[id].length === 0) delete localTaskPatches[id];
+        const modifiedTaskIds = new Set(state.modifiedTaskIds);
+        if (!hasLocalMutationIntent(localTaskPatches[id])) modifiedTaskIds.delete(id);
+        const taskConflicts = { ...state.taskConflicts };
+        delete taskConflicts[id];
+        const serverTask = state.serverTaskSnapshot.entitiesById[id] ?? currentTask;
+        const canonicalTask = {
+            ...serverTask,
+            lockVersion: Math.max(serverTask.lockVersion, lockVersion ?? serverTask.lockVersion)
+        };
+        const settledTask = applyLocalPatches(canonicalTask, localTaskPatches[id] ?? []);
+        const allTasks = state.allTasks.map(task => task.id === id ? settledTask : task);
+        const derived = buildDerivedTaskState(state, { allTasks });
+        return {
+            allTasks,
+            ...toDerivedTaskStatePatch(derived),
+            modifiedTaskIds,
+            localTaskPatches,
+            taskConflicts,
+            serverTaskSnapshot: {
+                ...state.serverTaskSnapshot,
+                entitiesById: { ...state.serverTaskSnapshot.entitiesById, [id]: canonicalTask },
+                revisions: {
+                    ...state.serverTaskSnapshot.revisions,
+                    [id]: Math.max(state.serverTaskSnapshot.revisions[id] ?? 0, canonicalTask.lockVersion)
+                }
+            }
+        };
+    }),
+
+    rollbackTaskOperation: (id, operationGeneration, rollbackFields = {}) => set((state) => {
+        const currentTask = state.allTasks.find(task => task.id === id);
+        const serverTask = state.serverTaskSnapshot.entitiesById[id] ?? (currentTask ? { ...currentTask, ...rollbackFields } : undefined);
+        if (!serverTask) return terminalTaskDeletionPatch(state, id, 'server');
+
+        const laterPatches = (state.localTaskPatches[id] ?? []).filter(patch => patch.generation > operationGeneration);
+        const rolledBackTask = laterPatches.length > 0 ? applyLocalPatches(serverTask, laterPatches) : serverTask;
+        const allTasks = state.allTasks.some(task => task.id === id)
+            ? state.allTasks.map(task => task.id === id ? rolledBackTask : task)
+            : [...state.allTasks, rolledBackTask];
+        const derived = buildDerivedTaskState(state, { allTasks });
+        const localTaskPatches = { ...state.localTaskPatches };
+        if (laterPatches.length > 0) {
+            localTaskPatches[id] = laterPatches;
+        } else {
+            delete localTaskPatches[id];
+        }
+        const modifiedTaskIds = new Set(state.modifiedTaskIds);
+        if (hasLocalMutationIntent(laterPatches)) {
+            modifiedTaskIds.add(id);
+        } else {
+            modifiedTaskIds.delete(id);
+        }
+
+        return {
+            allTasks,
+            ...toDerivedTaskStatePatch(derived),
+            localTaskPatches,
+            modifiedTaskIds,
+            ...settleBarOperationTaskOwnership(
+                state.barOperations,
+                state.activeBarOperationId,
+                id,
+                { mode: 'exact', generation: operationGeneration }
+            )
+        };
+    }),
+
+    applyTaskMutationMetadata: (taskId, metadata) => {
+        const invalidatedIds = new Set(metadata.invalidatedEntityIds ?? []);
+        const deletedIds = new Set(metadata.deletedEntityIds ?? []);
+        const needsRefresh = [...invalidatedIds].some(id => id !== taskId);
+
+        if (invalidatedIds.size > 0 || deletedIds.size > 0) invalidateDataRequests();
+
+        set((state) => {
+            if (deletedIds.has(taskId)) {
+                return terminalTaskDeletionPatch(state, taskId, 'server');
+            }
+            if (!metadata.entity) return state;
+            const currentTask = state.allTasks.find(task => task.id === taskId);
+            const currentServerTask = state.serverTaskSnapshot.entitiesById[taskId] ?? currentTask;
+            // Mutation entities contain persisted fields only. Build the internal
+            // compatibility snapshot from the existing server/view entity so a
+            // partial response can never manufacture view defaults.
+            const persistedServerTask = currentServerTask
+                ? { ...currentServerTask, ...metadata.entity } as Task
+                : undefined;
+            if (!persistedServerTask) return state;
+            const serverTaskSnapshot = mergeServerEntity(
+                state.serverTaskSnapshot,
+                persistedServerTask,
+                metadata.completeness ?? 'partial',
+                metadata.revision ?? metadata.entity.lockVersion ?? 0
+            );
+            const mergedTask = applyLocalPatches(
+                persistedServerTask,
+                state.localTaskPatches[taskId] ?? []
+            );
+            const allTasks = currentTask
+                ? state.allTasks.map(task => task.id === taskId ? { ...task, ...mergedTask } : task)
+                : [...state.allTasks, mergedTask];
+            const derived = buildDerivedTaskState(state, { allTasks });
+            return { serverTaskSnapshot, allTasks, ...toDerivedTaskStatePatch(derived) };
+        });
+
+        if (needsRefresh) {
+            queueMicrotask(() => {
+                void get().refreshData().catch((error) => console.error('Failed to refresh invalidated tasks', error));
+            });
+        }
+    },
+
+    refreshForMutationMetadata: (metadata) => {
+        if ((metadata.invalidatedEntityIds?.length ?? 0) === 0) return;
+        invalidateDataRequests();
+        queueMicrotask(() => {
+            void get().refreshData().catch((error) => console.error('Failed to refresh invalidated tasks', error));
+        });
+    },
+
+
+
+    removeTask: (id) => {
+        invalidateDataRequests();
+        set((state) => terminalTaskDeletionPatch(state, id, 'local'));
+    },
+
+    markTaskTombstone: (id, source = 'server', operationId) => set((state) => {
+        invalidateDataRequests();
+        const patch = terminalTaskDeletionPatch(state, id, source);
+        return {
+            ...patch,
+            taskTombstones: {
+                ...patch.taskTombstones,
+                [id]: { entityId: id, deletedAt: Date.now(), source, operationId }
+            }
+        };
+    }),
+
+    clearTaskTombstone: (id) => set((state) => {
+        if (!state.taskTombstones[id]) return state;
+        const taskTombstones = { ...state.taskTombstones };
+        delete taskTombstones[id];
+        return { taskTombstones };
+    }),
+
+    registerTaskConflict: (id, message, generation = get().editGenerations[id], remoteEntity, remoteRevision, remoteAvailability = remoteEntity ? 'known' : 'needs_refresh') => set((state) => ({
+        taskConflicts: {
+            ...state.taskConflicts,
+            [id]: { taskId: id, message, detectedAt: Date.now(), generation, remoteEntity, remoteRevision, remoteAvailability }
+        }
+    })),
+
+    resolveTaskConflict: async (id, resolution) => {
+        if (resolution === 'dismiss') {
+            return;
+        }
+
+        if (resolution === 'local') {
+            const beforeRetry = get();
+            const conflictRecord = beforeRetry.taskConflicts[id];
+            const conflictGeneration = conflictRecord?.generation;
+            const retryGeneration = beforeRetry.editGenerations[id] ?? conflictGeneration ?? 0;
+            const retryFields = (beforeRetry.localTaskPatches[id] ?? [])
+                .filter(patch => patch.generation <= retryGeneration)
+                .reduce<Partial<Task>>((fields, patch) => ({ ...fields, ...patch.mutationIntent }), {});
+            const retryTask = beforeRetry.allTasks.find(task => task.id === id);
+            const maxRetryGeneration = Math.max(
+                retryGeneration,
+                ...(beforeRetry.localTaskPatches[id] ?? []).map(patch => patch.generation)
+            );
+            const retryFieldNames = Object.keys(retryFields);
+            const hasPersistedRetryFields = retryFieldNames.length > 0;
+            const canRetryFieldsDirectly = retryTask && hasPersistedRetryFields && Object.keys(buildTaskPatchFieldsPayload(retryTask, retryFields)).length > 0;
+            set((state) => {
+                if (!state.taskConflicts[id]) return state;
+                const taskConflicts = { ...state.taskConflicts };
+                delete taskConflicts[id];
+                return { taskConflicts };
+            });
+            if (canRetryFieldsDirectly) {
+                try {
+                    let remoteTask = conflictRecord?.remoteEntity;
+                    let resyncData: Awaited<ReturnType<typeof fetchMutationResyncData>> | undefined;
+                    if (!remoteTask) {
+                        resyncData = await fetchMutationResyncData({ query: { selectedStatusIds: get().selectedStatusIds } });
+                        remoteTask = resyncData.tasks.find(task => task.id === id);
+                    }
+                    if (!remoteTask) {
+                        get().registerTaskConflict(
+                            id,
+                            conflictRecord?.message || (i18n.t('label_conflict') || 'Conflict'),
+                            retryGeneration,
+                            undefined,
+                            conflictRecord?.remoteRevision
+                        );
+                        return;
+                    }
+                    if (resyncData) get().applyApiData(resyncData);
+                    else get().applyTaskMutationMetadata(id, { entity: remoteTask, revision: conflictRecord?.remoteRevision ?? remoteTask.lockVersion });
+                    const result = await taskMutationService.updateTaskFields(id, () => {
+                        const latestTask = get().allTasks.find(task => task.id === id) ?? retryTask;
+                        return {
+                            ...buildTaskPatchFieldsPayload(latestTask, retryFields),
+                            lock_version: conflictRecord?.remoteRevision ?? remoteTask!.lockVersion
+                        };
+                    });
+                    get().applyTaskMutationMetadata(id, result);
+                    if (result.status === 'ok') {
+                        const committedGenerations = [...new Set((get().localTaskPatches[id] ?? [])
+                            .map(patch => patch.generation)
+                            .filter(generation => generation <= maxRetryGeneration))];
+                        committedGenerations.forEach((generation) => {
+                            get().commitTaskOperation(id, generation, result.lockVersion);
+                        });
+                        if (committedGenerations.length === 0 && typeof result.lockVersion === 'number') {
+                            get().setTaskLockVersion(id, result.lockVersion);
+                        }
+                        get().settleBarOperationTaskThrough(id, maxRetryGeneration);
+                        return;
+                    }
+                    const sourceDisposition = classifyMutationSourceDisposition(result);
+                    if (sourceDisposition === 'target_missing') {
+                        get().markTaskTombstone(id, 'server');
+                        return;
+                    }
+                    if (sourceDisposition === 'reference_missing' || sourceDisposition === 'source_preserved') {
+                        useUIStore.getState().addNotification(
+                            result.error || (i18n.t('label_failed_to_save') || 'Failed to save'),
+                            'error'
+                        );
+                        return;
+                    }
+                    if (result.status === 'conflict') {
+                        get().registerTaskConflict(id, result.error || (i18n.t('label_conflict') || 'Conflict'), retryGeneration, result.entity, result.revision ?? result.entity?.lockVersion);
+                        return;
+                    }
+                    get().registerTaskConflict(
+                        id,
+                        result.error || (i18n.t('label_failed_to_save') || 'Failed to save'),
+                        retryGeneration
+                    );
+                    useUIStore.getState().addNotification(
+                        `${i18n.t('label_failed_to_save') || 'Failed to save'} (#${id}: ${result.error || result.status})`,
+                        'error'
+                    );
+                    return;
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : (i18n.t('label_failed_to_save') || 'Failed to save');
+                    get().registerTaskConflict(id, message, retryGeneration);
+                    useUIStore.getState().addNotification(message, 'error');
+                    return;
+                }
+            }
+            const failures = await get().saveChanges();
+            if (!failures.has(id) && conflictGeneration !== undefined) {
+                get().settleBarOperationTask(id, conflictGeneration);
+            }
+            return;
+        }
+
+        invalidateDataRequests();
+        let remoteEntity = get().taskConflicts[id]?.remoteEntity;
+        if (!remoteEntity) {
+            try {
+                const resyncData = await fetchMutationResyncData({ query: { selectedStatusIds: get().selectedStatusIds } });
+                remoteEntity = resyncData.tasks.find(task => task.id === id);
+                if (!remoteEntity) throw new Error(i18n.t('label_task_not_found') || 'Task no longer exists');
+                get().applyApiData(resyncData);
+            } catch (error) {
+                const message = error instanceof Error ? error.message : (i18n.t('label_conflict') || 'Conflict');
+                const conflict = get().taskConflicts[id];
+                get().registerTaskConflict(id, conflict?.message || message, conflict?.generation, undefined, conflict?.remoteRevision, 'unavailable');
+                useUIStore.getState().addNotification(message, 'error');
+                return;
+            }
+        }
+
+        const resolvedRemoteEntity = remoteEntity;
+        set((state) => {
+            const recordedConflictGeneration = state.taskConflicts[id]?.generation;
+            const conflictGeneration = recordedConflictGeneration ?? state.editGenerations[id] ?? 0;
+            const conflictRecord = state.taskConflicts[id];
+            const currentTask = state.allTasks.find(task => task.id === id)
+                ?? state.serverTaskSnapshot.entitiesById[id];
+            if (!currentTask) return state;
+            const remoteTask = { ...currentTask, ...resolvedRemoteEntity };
+            const laterPatches = recordedConflictGeneration !== undefined
+                ? (state.localTaskPatches[id] ?? []).filter(patch => patch.generation > conflictGeneration)
+                : [];
+            const resolvedTask = laterPatches.length > 0
+                ? applyLocalPatches(remoteTask, laterPatches)
+                : remoteTask;
+            const allTasks = state.allTasks.some(task => task.id === id)
+                ? state.allTasks.map(task => task.id === id ? resolvedTask : task)
+                : [...state.allTasks, resolvedTask];
+            const derived = buildDerivedTaskState(state, { allTasks });
+            const localTaskPatches = { ...state.localTaskPatches };
+            if (laterPatches.length > 0) localTaskPatches[id] = laterPatches;
+            else delete localTaskPatches[id];
+            const modifiedTaskIds = new Set(state.modifiedTaskIds);
+            if (hasLocalMutationIntent(laterPatches)) modifiedTaskIds.add(id);
+            else modifiedTaskIds.delete(id);
+            const taskTombstones = { ...state.taskTombstones };
+            delete taskTombstones[id];
+            const taskConflicts = { ...state.taskConflicts };
+            delete taskConflicts[id];
+            const settlement = settleBarOperationTaskOwnership(
+                state.barOperations,
+                state.activeBarOperationId,
+                id,
+                { mode: 'exact', generation: conflictGeneration }
+            );
+            return {
+                allTasks,
+                ...toDerivedTaskStatePatch(derived),
+                serverTaskSnapshot: mergeServerEntity(
+                    state.serverTaskSnapshot,
+                    remoteTask,
+                    'complete',
+                    conflictRecord?.remoteRevision ?? remoteTask.lockVersion
+                ),
+                localTaskPatches,
+                modifiedTaskIds,
+                taskTombstones,
+                taskConflicts,
+                ...settlement
+            };
+        });
+    },
 
     updateViewport: (updates) => set((state) => {
         const nextViewport = { ...state.viewport, ...updates };
-
-        // Must match BOTTOM_PADDING_PX in GanttContainer.tsx
-        const BOTTOM_PADDING_PX = 40;
-        const totalHeight = Math.max(0, state.rowCount * nextViewport.rowHeight + BOTTOM_PADDING_PX);
-        const maxScrollY = Math.max(0, totalHeight - nextViewport.height);
-        const nextScrollY = Math.max(0, Math.min(maxScrollY, nextViewport.scrollY));
+        const nextScrollY = clampViewportScrollY(nextViewport.scrollY, nextViewport, state.rowCount);
 
         const nextState: Partial<TaskState> = {
             viewport: { ...nextViewport, scrollY: nextScrollY }
@@ -1311,6 +2385,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     }),
 
     setSelectedAssigneeIds: (ids) => set((state) => {
+        invalidateDataRequests();
         const layout = buildLayoutFromState(state, { selectedAssigneeIds: ids });
         const queryContext = setAssigneeOverride(state.queryContext, ids.length > 0
             ? { mode: 'subset', values: ids }
@@ -1328,6 +2403,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     }),
 
     setSelectedProjectIds: (ids) => set((state) => {
+        invalidateDataRequests();
         const layout = buildLayoutFromState(state, { selectedProjectIds: ids });
         const nextState = {
             selectedProjectIds: ids,
@@ -1341,6 +2417,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         return nextState;
     }),
     setSelectedVersionIds: (ids) => set((state) => {
+        invalidateDataRequests();
         const layout = buildLayoutFromState(state, { selectedVersionIds: ids });
         const queryContext = setVersionOverride(state.queryContext, ids.length > 0
             ? { mode: 'subset', values: ids }
@@ -1356,10 +2433,28 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         queueRefreshData(get().refreshData);
         return nextState;
     }),
+    setSelectedTrackerIds: (ids) => set((state) => {
+        invalidateDataRequests();
+        const layout = buildLayoutFromState(state, { selectedTrackerIds: ids });
+        const queryContext = setTrackerOverride(state.queryContext, ids.length > 0
+            ? { mode: 'subset', values: ids }
+            : { mode: 'all' });
+        const nextState = {
+            ...queryContextPatch(queryContext),
+            selectedTrackerIds: ids,
+            tasks: layout.tasks,
+            layoutRows: layout.layoutRows,
+            rowCount: layout.rowCount
+        };
+        syncSharedQueryState({ ...state, ...nextState });
+        queueRefreshData(get().refreshData);
+        return nextState;
+    }),
     setMemberProjectsOnly: async (enabled) => {
         const current = get();
         if (current.memberProjectsOnly === enabled) return;
 
+        invalidateDataRequests();
         set({ memberProjectsOnly: enabled });
         saveDisplayPreferences({ memberProjectsOnly: enabled }, current.currentProjectId);
         syncSharedQueryState({ ...get(), memberProjectsOnly: enabled });
@@ -1445,11 +2540,11 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             layoutRows: layout.layoutRows,
             rowCount: layout.rowCount,
             viewport: computeFocusedViewport({
-                ...state,
+                viewport: state.viewport,
                 rowCount: layout.rowCount,
-                tasks: layout.tasks,
-                layoutRows: layout.layoutRows
-            }, focusedTask),
+                targetTimestamp: getTaskFocusTimestamp(focusedTask),
+                targetRowIndex: focusedTask.rowIndex
+            }),
             selectedTaskId: taskId,
             selectedRelationId: null,
             draftRelation: null,
@@ -1483,15 +2578,27 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         syncSharedQueryState({ ...state, ...nextState });
         return nextState;
     }),
-    refreshData: async () => {
-        const { apiClient } = await import('../api/client');
+        refreshData: async () => refreshCurrentData('refresh'),
+
+    loadInitialData: async (params) => {
+        const generation = ++dataRequestGeneration;
         const state = get();
-        const data = await apiClient.fetchData({
-            query: toResolvedQueryStateFromStore(state),
-            queryContext: state.queryContext
+        const context = createReadContext({
+            generation,
+            projectId: state.currentProjectId,
+            query: params.query ?? params.initialState ?? {},
+            scope: { rawSearch: params.rawSearch, queryContext: params.queryContext },
+            purpose: 'initial_load'
         });
-        if (!data) return;
-        get().applyApiData(data);
+        await requestAndApplyData(async () => {
+            const { initialState, ...fetchParams } = params;
+            const data = await apiClient.fetchData(fetchParams);
+            return {
+                ...data,
+                ...(initialState ? { initialState: { ...data.initialState, ...initialState } } : {}),
+                ...(params.queryContext ? { queryContext: params.queryContext } : {})
+            };
+        }, context);
     },
 
     loadSavedQueries: async (force = false) => {
@@ -1500,13 +2607,24 @@ export const useTaskStore = create<TaskState>((set, get) => ({
             return;
         }
 
+        const context = createReadContext({
+            generation: ++auxiliaryReadGeneration,
+            projectId: get().currentProjectId,
+            query: { force },
+            scope: { savedQueries: true },
+            purpose: 'saved_queries',
+            mergePolicy: 'replace'
+        });
+        auxiliaryReadContext = context;
         set({ savedQueriesStatus: 'loading', savedQueriesError: null });
 
         try {
             const { apiClient } = await import('../api/client');
             const queries = await apiClient.fetchQueries();
+            if (!canApplyReadResponse(auxiliaryReadContext, context)) return;
             set({ savedQueries: queries, savedQueriesStatus: 'ready' });
         } catch (error) {
+            if (!canApplyReadResponse(auxiliaryReadContext, context)) return;
             set({
                 savedQueries: [],
                 savedQueriesStatus: 'error',
@@ -1516,7 +2634,7 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     },
 
     applySavedQuery: async (queryId) => {
-        const { apiClient } = await import('../api/client');
+        const generation = ++dataRequestGeneration;
         const state = get();
         const queryContext = selectSavedQuery(queryId);
         const query: ResolvedQueryState = {
@@ -1531,43 +2649,397 @@ export const useTaskStore = create<TaskState>((set, get) => ({
         });
         replaceIssueQueryParamsInUrl(query, queryContext);
         syncSharedQueryState({ ...get(), activeQueryId: queryId });
-        const data = await apiClient.fetchData({ query, queryContext });
-        get().applyApiData(data);
+        const context = createReadContext({
+            generation,
+            projectId: state.currentProjectId,
+            query,
+            scope: { showSubprojects: state.showSubprojects, memberProjectsOnly: state.memberProjectsOnly },
+            purpose: 'saved_query'
+        });
+        await requestAndApplyData(() => apiClient.fetchData({ query, queryContext }), context);
     },
 
     clearSavedQuery: async () => {
+        invalidateDataRequests();
         const state = get();
         const queryContext = clearSavedQueryToStandalone(standaloneOverridesFromState(state));
         set({ activeQueryId: null, ...queryContextPatch(queryContext) });
         syncSharedQueryState({ ...get(), activeQueryId: null });
-        await get().refreshData();
+        await refreshCurrentData('saved_query');
     },
 
     saveChanges: async () => {
-        const { apiClient } = await import('../api/client');
-        const state = get();
-        const failures = await saveModifiedTasks(
-            state.allTasks,
-            state.relations,
-            state.modifiedTaskIds,
-            state.selectedStatusIds,
-            apiClient.updateTask,
-            apiClient.fetchData
-        );
+        if (saveChangesOperation) return saveChangesOperation;
 
-        await state.refreshData();
-        if (failures.size > 0) {
-            const [failedTaskId, failedReason] = failures.entries().next().value as [string, string];
-            useUIStore.getState().addNotification(
-                `${i18n.t('label_failed_to_save') || 'Failed to save'} (#${failedTaskId}: ${failedReason})`,
-                'error'
-            );
+        const operation = (async () => {
+            while (true) {
+                const snapshot = get();
+                if (snapshot.modifiedTaskIds.size === 0) return new Map<string, string>();
+
+                const snapshotGenerations = { ...snapshot.editGenerations };
+                const snapshotTaskIds = new Set(snapshot.modifiedTaskIds);
+                const snapshotMutationFields: Record<string, TaskFields> = {};
+                const snapshotMutationScheduling: Record<string, boolean> = {};
+                const unsupportedMutationFailures = new Map<string, string>();
+                snapshotTaskIds.forEach((taskId) => {
+                    if (snapshot.taskConflicts[taskId]) {
+                        unsupportedMutationFailures.set(taskId, i18n.t('label_unresolved_task_conflict') || 'Resolve the task conflict before saving.');
+                        return;
+                    }
+                    const task = snapshot.allTasks.find(candidate => candidate.id === taskId);
+                    const fields = (snapshot.localTaskPatches[taskId] ?? []).reduce<Partial<Task>>(
+                        (owned, patch) => ({ ...owned, ...patch.mutationIntent }), {}
+                    );
+                    if (task) {
+                        const changedFields = Object.keys(fields).filter(field => PERSISTABLE_TASK_FIELDS.includes(field as typeof PERSISTABLE_TASK_FIELDS[number]));
+                        const intendedTask = { ...task, ...fields };
+                        const delta = buildTaskMutationDelta(
+                            taskId,
+                            snapshotGenerations[taskId] ?? 0,
+                            intendedTask,
+                            changedFields
+                        );
+                        if (Object.keys(delta.fields).length === 0) {
+                            unsupportedMutationFailures.set(
+                                taskId,
+                                i18n.t('label_no_bulk_supported_mutation_fields') || 'No saveable task changes are available.'
+                            );
+                        } else {
+                            snapshotMutationFields[taskId] = delta.fields;
+                            snapshotMutationScheduling[taskId] = Object.prototype.hasOwnProperty.call(delta.fields, 'start_date') ||
+                                Object.prototype.hasOwnProperty.call(delta.fields, 'due_date');
+                        }
+                    }
+                });
+                const terminalBarFailureTaskGenerations = new Map<string, number>();
+                const conflictMessages = new Map<string, { message: string; generation: number; remoteEntity?: PersistedTaskState; remoteRevision?: number; remoteAvailability: MutationRemoteAvailability }>();
+                const savedLockVersions = new Map<string, number>();
+                const mutationMetadataRecords: Array<{ taskId: string; metadata: MutationMetadata }> = [];
+                let mutationMetadataNeedsRefresh = false;
+                const hasScheduleMutation = Object.values(snapshotMutationScheduling).some(Boolean);
+                invalidateDataRequests();
+                const saveResult = await saveModifiedTasks(
+                    snapshot.allTasks,
+                    snapshot.relations,
+                    snapshot.modifiedTaskIds,
+                    snapshot.selectedStatusIds,
+                    taskMutationService.updateTask,
+                    fetchMutationResyncData,
+                    (taskId, lockVersion) => {
+                        if (typeof lockVersion !== 'number') return;
+                        savedLockVersions.set(
+                            taskId,
+                            Math.max(savedLockVersions.get(taskId) ?? 0, lockVersion)
+                        );
+                    },
+                    (taskId, result) => {
+                        const invalidatedEntityIds = result.invalidatedEntityIds ?? [];
+                        const deletedEntityIds = result.deletedEntityIds ?? [];
+                        const sourceDisposition = classifyMutationSourceDisposition(result);
+                        const targetMissing = sourceDisposition === 'target_missing';
+                        const operationScopeConflict = result.status === 'conflict' && result.failure?.resourceRole === 'scope';
+                        if (operationScopeConflict) {
+                            // A topology conflict has no stale task owner. It
+                            // refreshes the remote scope while leaving every
+                            // local schedule intent unresolved for a later
+                            // explicit retry.
+                            invalidateDataRequests();
+                            mutationMetadataNeedsRefresh = true;
+                        }
+                        if (invalidatedEntityIds.length > 0 || deletedEntityIds.length > 0) {
+                            invalidateDataRequests();
+                            if (invalidatedEntityIds.some((id) => id !== taskId)) {
+                                mutationMetadataNeedsRefresh = true;
+                            }
+                        }
+                        if (targetMissing) {
+                            invalidateDataRequests();
+                        }
+                        if (result.entity || invalidatedEntityIds.length > 0 || deletedEntityIds.length > 0 || targetMissing) {
+                            mutationMetadataRecords.push({
+                                taskId,
+                                metadata: targetMissing
+                                    ? {
+                                        ...result,
+                                        deletedEntityIds: [...new Set([...deletedEntityIds, taskId])]
+                                    }
+                                    : result
+                            });
+                        }
+                        if (result.status === 'ok') {
+                            get().settleBarOperationTaskThrough(taskId, snapshotGenerations[taskId] ?? 0);
+                        } else if (result.status === 'validation_error' || result.status === 'forbidden' || sourceDisposition !== 'not_applicable') {
+                            const operationGeneration = snapshotGenerations[taskId] ?? 0;
+                            const hasBarOperation = Object.values(get().barOperations).some((operation) => (
+                                operation.entityGenerations[taskId] === operationGeneration
+                            ));
+                            if (hasBarOperation) {
+                                terminalBarFailureTaskGenerations.set(taskId, operationGeneration);
+                            }
+                        }
+                    },
+                    (taskId, message, remoteEntity, remoteRevision) => {
+                        if (remoteEntity) {
+                            mutationMetadataRecords.push({
+                                taskId,
+                                metadata: {
+                                    entity: remoteEntity,
+                                    revision: remoteRevision ?? remoteEntity.lockVersion
+                                }
+                            });
+                        }
+                        conflictMessages.set(taskId, {
+                            message,
+                            generation: snapshotGenerations[taskId] ?? 0,
+                            remoteEntity,
+                            remoteRevision,
+                            remoteAvailability: remoteEntity ? 'known' : 'unavailable'
+                        });
+                    },
+                    (taskId) => {
+                        if (terminalBarFailureTaskGenerations.size === 0) return false;
+                        const operationGeneration = terminalBarFailureTaskGenerations.get(taskId);
+                        if (operationGeneration !== undefined) return true;
+                        return Object.values(get().barOperations).some((operation) => (
+                            operation.entityGenerations[taskId] !== undefined &&
+                            Object.entries(operation.entityGenerations).some(([failedTaskId, failedGeneration]) => (
+                                terminalBarFailureTaskGenerations.get(failedTaskId) === failedGeneration
+                            ))
+                        ));
+                    },
+                    snapshotGenerations,
+                    snapshotMutationFields,
+                    unsupportedMutationFailures,
+                    snapshotMutationScheduling,
+                    typeof apiClient.scheduleMutation === 'function' ? (changes) => taskMutationService.scheduleMutation(changes.map(change => ({
+                        taskId: change.taskId,
+                        baseRevision: change.baseRevision,
+                        task: change.task,
+                        mutationFields: change.mutationFields,
+                        ...(Object.prototype.hasOwnProperty.call(change.fields, 'start_date') ? { startDate: parseDateOnly(change.fields.start_date as string | null) } : {}),
+                        ...(Object.prototype.hasOwnProperty.call(change.fields, 'due_date') ? { dueDate: parseDateOnly(change.fields.due_date as string | null) } : {})
+                    }))) : undefined,
+                    snapshot.serverTaskSnapshot.revisions
+                );
+                const { failures, savedTaskIds, settledFieldsByTask } = saveResult;
+
+                if (savedLockVersions.size > 0 || mutationMetadataRecords.length > 0) {
+                    set((state) => {
+                        const currentTaskById = new Map(state.allTasks.map((task) => [task.id, task]));
+                        const entitiesById = { ...state.serverTaskSnapshot.entitiesById };
+                        const revisions = { ...state.serverTaskSnapshot.revisions };
+                        const affectedTaskIds = new Set<string>();
+                        const deletedTaskIds = new Set<string>();
+
+                        mutationMetadataRecords.forEach(({ taskId, metadata }) => {
+                            const deletedEntityIds = new Set(metadata.deletedEntityIds ?? []);
+                            deletedEntityIds.forEach((deletedTaskId) => {
+                                deletedTaskIds.add(deletedTaskId);
+                                delete entitiesById[deletedTaskId];
+                                delete revisions[deletedTaskId];
+                            });
+                            if (deletedTaskIds.has(taskId)) return;
+                            if (!metadata.entity) return;
+                            affectedTaskIds.add(taskId);
+
+                            const currentTask = currentTaskById.get(taskId);
+                            const currentServerTask = entitiesById[taskId] ?? currentTask;
+                            if (!currentServerTask) return;
+
+                            const persistedServerTask = {
+                                ...currentServerTask,
+                                ...metadata.entity
+                            } as Task;
+                            const revision = metadata.revision ?? metadata.entity.lockVersion ?? 0;
+                            const currentRevision = revisions[taskId] ?? 0;
+                            if (revision < currentRevision) return;
+
+                            entitiesById[taskId] = metadata.completeness === 'partial' && entitiesById[taskId]
+                                ? { ...entitiesById[taskId], ...persistedServerTask }
+                                : persistedServerTask;
+                            revisions[taskId] = Math.max(currentRevision, revision);
+                        });
+
+                        savedLockVersions.forEach((lockVersion, taskId) => {
+                            if (deletedTaskIds.has(taskId)) return;
+                            const currentTask = currentTaskById.get(taskId);
+                            const currentServerTask = entitiesById[taskId] ?? currentTask;
+                            if (!currentServerTask) return;
+
+                            affectedTaskIds.add(taskId);
+                            const canonicalTask = {
+                                ...currentServerTask,
+                                lockVersion: Math.max(currentServerTask.lockVersion, lockVersion)
+                            };
+                            entitiesById[taskId] = canonicalTask;
+                            revisions[taskId] = Math.max(revisions[taskId] ?? 0, lockVersion);
+                        });
+
+                        const settledTaskById = new Map<string, Task>();
+                        affectedTaskIds.forEach((taskId) => {
+                            if (deletedTaskIds.has(taskId)) return;
+                            const currentTask = currentTaskById.get(taskId);
+                            const canonicalTask = entitiesById[taskId] ?? currentTask;
+                            if (!canonicalTask) return;
+
+                            const patches = state.localTaskPatches[taskId] ?? [];
+                            const patchesToApply = savedLockVersions.has(taskId)
+                                ? settleLocalPatchFields(
+                                    patches,
+                                    snapshotGenerations[taskId] ?? 0,
+                                    settledFieldsByTask.get(taskId) ?? []
+                                )
+                                : patches;
+                            settledTaskById.set(taskId, applyLocalPatches(canonicalTask, patchesToApply));
+                        });
+
+                        const allTasks = state.allTasks
+                            .filter((task) => !deletedTaskIds.has(task.id))
+                            .map((task) => settledTaskById.get(task.id) ?? task);
+                        settledTaskById.forEach((task, taskId) => {
+                            if (!currentTaskById.has(taskId) && !deletedTaskIds.has(taskId)) {
+                                allTasks.push(task);
+                            }
+                        });
+
+                        let localTaskPatches = state.localTaskPatches;
+                        let modifiedTaskIds = state.modifiedTaskIds;
+                        let taskConflicts = state.taskConflicts;
+                        let taskTombstones = state.taskTombstones;
+                        let barOperations = state.barOperations;
+                        let activeBarOperationId = state.activeBarOperationId;
+                        if (deletedTaskIds.size > 0) {
+                            localTaskPatches = { ...state.localTaskPatches };
+                            modifiedTaskIds = new Set(state.modifiedTaskIds);
+                            taskConflicts = { ...state.taskConflicts };
+                            taskTombstones = { ...state.taskTombstones };
+                            deletedTaskIds.forEach((taskId) => {
+                                delete localTaskPatches[taskId];
+                                modifiedTaskIds.delete(taskId);
+                                delete taskConflicts[taskId];
+                                delete entitiesById[taskId];
+                                delete revisions[taskId];
+                                taskTombstones[taskId] = {
+                                    entityId: taskId,
+                                    deletedAt: Date.now(),
+                                    source: 'server'
+                                };
+                                const settlement = settleBarOperationTaskOwnership(
+                                    barOperations,
+                                    activeBarOperationId,
+                                    taskId,
+                                    { mode: 'all' }
+                                );
+                                barOperations = settlement.barOperations;
+                                activeBarOperationId = settlement.activeBarOperationId;
+                            });
+                        }
+
+                        const hasDerivedChanges = affectedTaskIds.size > 0 || deletedTaskIds.size > 0;
+                        const derived = hasDerivedChanges
+                            ? buildDerivedTaskState(state, { allTasks })
+                            : undefined;
+                        return {
+                            allTasks,
+                            ...(derived ? toDerivedTaskStatePatch(derived) : {}),
+                            ...(deletedTaskIds.size > 0
+                                ? { localTaskPatches, modifiedTaskIds, taskConflicts, taskTombstones, barOperations, activeBarOperationId }
+                                : {}),
+                            serverTaskSnapshot: {
+                                ...state.serverTaskSnapshot,
+                                entitiesById,
+                                revisions
+                            }
+                        };
+                    });
+                }
+
+                set((state) => {
+                    const modifiedTaskIds = new Set(state.modifiedTaskIds);
+                    const localTaskPatches = { ...state.localTaskPatches };
+                    snapshotTaskIds.forEach((taskId) => {
+                        if (!savedTaskIds.has(taskId)) return;
+                        const savedGeneration = snapshotGenerations[taskId] ?? 0;
+                        const remainingPatches = settleLocalPatchFields(
+                            localTaskPatches[taskId] ?? [],
+                            savedGeneration,
+                            settledFieldsByTask.get(taskId) ?? []
+                        );
+                        if (remainingPatches.length > 0) {
+                            localTaskPatches[taskId] = remainingPatches;
+                        } else {
+                            delete localTaskPatches[taskId];
+                        }
+                        if (hasLocalMutationIntent(remainingPatches)) {
+                            modifiedTaskIds.add(taskId);
+                        } else {
+                            modifiedTaskIds.delete(taskId);
+                        }
+                    });
+                    return { modifiedTaskIds, localTaskPatches };
+                });
+
+                const requiresResync = saveResult.savedTaskIds.size > 0 && [...saveResult.savedTaskIds].some(taskId => (
+                    (snapshot.localTaskPatches[taskId] ?? []).some(patch => (
+                        BULK_TASK_FIELDS.some(field => field in patch.mutationIntent)
+                    ))
+                ));
+                if (saveResult.batchStatus !== 'preflight_failure' && hasScheduleMutation && requiresResync) {
+                    try {
+                        await get().refreshData();
+                    } catch (error) {
+                        // A failed conflict resync is already represented as a
+                        // terminal conflict. Do not replace that actionable
+                        // result with a second refresh exception; the local
+                        // patch must remain available for manual resolution.
+                        if (conflictMessages.size === 0) throw error;
+                    }
+                }
+                if (mutationMetadataNeedsRefresh) {
+                    queueMicrotask(() => {
+                        void get().refreshData().catch((error) => console.error('Failed to refresh invalidated tasks', error));
+                    });
+                }
+                if (conflictMessages.size > 0) {
+                    set((state) => {
+                        const taskConflicts = { ...state.taskConflicts };
+                        conflictMessages.forEach(({ message, generation, remoteEntity, remoteRevision, remoteAvailability }, taskId) => {
+                            taskConflicts[taskId] = { taskId, message, detectedAt: Date.now(), generation, remoteEntity, remoteRevision, remoteAvailability };
+                        });
+                        return { taskConflicts };
+                    });
+                }
+                terminalBarFailureTaskGenerations.forEach((operationGeneration, taskId) => {
+                    const operation = Object.values(get().barOperations).find((candidate) => (
+                        candidate.entityGenerations[taskId] === operationGeneration
+                    ));
+                    if (operation) get().rollbackBarOperation(operation.operationId);
+                });
+                if (failures.size > 0) {
+                    const [failedTaskId, failedReason] = failures.entries().next().value as [string, string];
+                    useUIStore.getState().addNotification(
+                        `${i18n.t('label_failed_to_save') || 'Failed to save'} (#${failedTaskId}: ${failedReason})`,
+                        'error'
+                    );
+                    return failures;
+                }
+
+                if (get().modifiedTaskIds.size === 0) return failures;
+            }
+        })();
+
+        saveChangesOperation = operation;
+        try {
+            return await operation;
+        } finally {
+            if (saveChangesOperation === operation) saveChangesOperation = null;
         }
-        return failures;
     },
 
     discardChanges: async () => {
         const state = get();
+        set({ localTaskPatches: {}, modifiedTaskIds: new Set(), barOperations: {}, activeBarOperationId: null });
         await state.refreshData();
     }
-}));
+});
+});

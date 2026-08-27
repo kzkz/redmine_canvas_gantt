@@ -11,6 +11,7 @@ import {
 } from './relationGeometry';
 import { designTokens } from '../styles/designTokens';
 import { getCanvasLogicalSize } from '../utils/canvasDpr';
+import { todayCalendarDate, type CalendarDate } from '../utils/dateOnly';
 
 export type OverlayRenderState = {
     viewport: Viewport;
@@ -21,6 +22,7 @@ export type OverlayRenderState = {
     selectedTaskId: string | null;
     selectedRelationId: string | null;
     draftRelation: DraftRelation | null;
+    today?: CalendarDate;
 };
 
 export class OverlayRenderer {
@@ -39,7 +41,8 @@ export class OverlayRenderer {
         zoomLevel,
         selectedTaskId,
         selectedRelationId,
-        draftRelation
+        draftRelation,
+        today = todayCalendarDate()
     }: OverlayRenderState) {
         const ctx = this.canvas.getContext('2d');
         if (!ctx) return;
@@ -70,13 +73,13 @@ export class OverlayRenderer {
         }
 
         // Draw Inazuma line (Progress Line)
-        this.drawProgressLine(ctx, viewport, visibleTasks, zoomLevel);
+        this.drawProgressLine(ctx, viewport, visibleTasks, zoomLevel, today);
 
         // Draw "Today" line
-        this.drawTodayLine(ctx, viewport, width, height);
+        this.drawTodayLine(ctx, viewport, width, height, today);
     }
 
-    private drawProgressLine(ctx: CanvasRenderingContext2D, viewport: Viewport, tasks: Task[], zoomLevel: ZoomLevel) {
+    private drawProgressLine(ctx: CanvasRenderingContext2D, viewport: Viewport, tasks: Task[], zoomLevel: ZoomLevel, todayStart: CalendarDate = todayCalendarDate()) {
         const { showProgressLine } = useUIStore.getState();
         if (!showProgressLine) return;
 
@@ -86,9 +89,7 @@ export class OverlayRenderer {
         if (drawableTasks.length === 0) return;
 
         // Calculate Today X
-        const todayStart = new Date().setHours(0, 0, 0, 0);
-        const ONE_DAY = 24 * 60 * 60 * 1000;
-        const xToday = LayoutEngine.dateToX(todayStart + ONE_DAY, viewport) - viewport.scrollX;
+        const xToday = LayoutEngine.calendarDateToX(todayStart, viewport, 'end') - viewport.scrollX;
 
         ctx.save();
         ctx.beginPath();
@@ -125,24 +126,8 @@ export class OverlayRenderer {
                 // Use the center of the bar (or point) as the Y anchor
                 pointY = bounds.y + bounds.height / 2;
 
-                // Determine effective start and end dates for progress calculation
-                let effectiveStart: number;
-                let effectiveEnd: number;
                 const isSingleDate = (hasStart && !hasDue) || (!hasStart && hasDue);
-
-                if (hasStart && hasDue) {
-                    effectiveStart = LayoutEngine.snapDate(task.startDate, zoomLevel);
-                    // For bars, the end is inclusive, so detailed end is due + 1 day
-                    effectiveEnd = Math.max(effectiveStart, LayoutEngine.snapDate(task.dueDate, zoomLevel)) + ONE_DAY;
-                } else if (hasStart) {
-                    // Only Start: Treat as 1 day at Start Date
-                    effectiveStart = LayoutEngine.snapDate(task.startDate, zoomLevel);
-                    effectiveEnd = effectiveStart + ONE_DAY;
-                } else {
-                    // Only Due: Treat as 1 day at Due Date
-                    effectiveStart = LayoutEngine.snapDate(task.dueDate, zoomLevel);
-                    effectiveEnd = effectiveStart + ONE_DAY;
-                }
+                const effectiveStart = hasStart ? snappedStart : snappedDue;
 
                 // Single date task with date = today: pass through today line
                 if ((hasStart && !hasDue && isStartToday) || (!hasStart && hasDue && isDueToday)) {
@@ -161,13 +146,7 @@ export class OverlayRenderer {
                 } else {
                     const ratio = hasProgress ? Math.max(0, Math.min(100, task.ratioDone)) : 0;
 
-                    // X coordinate corresponding to the % completion
-                    // pointX = StartX + (Width * Ratio)
-                    const startX = LayoutEngine.dateToX(effectiveStart, viewport) - viewport.scrollX;
-                    const endX = LayoutEngine.dateToX(effectiveEnd, viewport) - viewport.scrollX;
-                    const width = endX - startX;
-
-                    pointX = startX + width * (ratio / 100);
+                    pointX = bounds.x + bounds.width * (ratio / 100);
                 }
             } else {
                 // No dates: Snap to Today line
@@ -279,11 +258,9 @@ export class OverlayRenderer {
         ctx.setLineDash([]);
     }
 
-    private drawTodayLine(ctx: CanvasRenderingContext2D, viewport: Viewport, width: number, height: number) {
-        const today = new Date().setHours(0, 0, 0, 0);
-        const ONE_DAY = 24 * 60 * 60 * 1000;
+    private drawTodayLine(ctx: CanvasRenderingContext2D, viewport: Viewport, width: number, height: number, today: CalendarDate = todayCalendarDate()) {
         // Redmine standard: draw at the right edge of "today" column.
-        const x = LayoutEngine.dateToX(today + ONE_DAY, viewport) - viewport.scrollX;
+        const x = LayoutEngine.calendarDateToX(today, viewport, 'end') - viewport.scrollX;
 
         if (x >= 0 && x <= width) {
             const COLOR = '#4285f4'; // Blue like the reference image

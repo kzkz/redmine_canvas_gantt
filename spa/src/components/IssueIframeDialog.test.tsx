@@ -5,6 +5,8 @@ import { useUIStore } from '../stores/UIStore';
 import { useTaskStore } from '../stores/TaskStore';
 import { applyIssueDialogStyles, findIssueDialogErrorElement, getIssueDialogErrorMessage } from '../utils/iframeStyles';
 
+type RefreshData = ReturnType<typeof useTaskStore.getState>['refreshData'];
+
 vi.mock('../utils/iframeStyles', () => ({
     applyIssueDialogStyles: vi.fn(),
     applyLinkTargetBlank: vi.fn(),
@@ -51,7 +53,7 @@ describe('IssueIframeDialog', () => {
     beforeEach(() => {
         window.ResizeObserver = ResizeObserverMock as unknown as typeof ResizeObserver;
         useUIStore.setState({ issueDialogUrl: '/issues/123/edit', queryDialogUrl: null });
-        useTaskStore.setState({ refreshData: vi.fn() as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: vi.fn() as unknown as RefreshData });
         vi.mocked(applyIssueDialogStyles).mockReset();
         vi.mocked(findIssueDialogErrorElement).mockReset();
         vi.mocked(getIssueDialogErrorMessage).mockReset();
@@ -117,7 +119,7 @@ describe('IssueIframeDialog', () => {
 
     it('closes the dialog when Escape key is pressed', () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
 
         render(<IssueIframeDialog />);
         fireEvent.keyDown(window, { key: 'Escape' });
@@ -159,6 +161,16 @@ describe('IssueIframeDialog', () => {
         expect(footerButtons[1].style.height).toBe('28px');
         expect(footerButtons[0].style.minWidth).toBe('88px');
         expect(footerButtons[1].style.minWidth).toBe('88px');
+    });
+
+    it('offers bulk child creation for an issue show dialog', () => {
+        useUIStore.setState({ issueDialogUrl: '/issues/123', queryDialogUrl: null });
+
+        render(<IssueIframeDialog />);
+
+        fireEvent.click(screen.getByText('Bulk Ticket Creation'));
+
+        expect(screen.getByTestId('bulk-subtask-subjects')).toBeInTheDocument();
     });
 
     it('shrinks dialog height for short iframe content', async () => {
@@ -234,6 +246,40 @@ describe('IssueIframeDialog', () => {
         expect(screen.queryByRole('button', { name: 'Save issue' })).not.toBeInTheDocument();
     });
 
+    it('changes the issue-show primary action to Save and auto-submits the parent exactly once', async () => {
+        useUIStore.setState({ issueDialogUrl: '/issues/123', queryDialogUrl: null });
+        const { container } = render(<IssueIframeDialog />);
+        const iframe = container.querySelector('iframe') as HTMLIFrameElement;
+        const doc = document.implementation.createHTMLDocument('iframe');
+        doc.body.innerHTML = '<div id="content"><p>Issue detail</p></div>';
+        const iframeWindow = { location: { href: 'http://example.com/issues/123' }, document: doc };
+        Object.defineProperty(iframe, 'contentWindow', { value: iframeWindow, configurable: true });
+        Object.defineProperty(iframe, 'contentDocument', { value: doc, configurable: true });
+        vi.mocked(getIssueDialogErrorMessage).mockReturnValue(null);
+
+        fireEvent.load(iframe);
+        fireEvent.click(screen.getByText('Bulk Ticket Creation'));
+        fireEvent.change(screen.getByTestId('bulk-subtask-subjects'), {
+            target: { value: 'Child A' }
+        });
+
+        expect(screen.getByRole('button', { name: 'Save' })).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+        expect(iframeWindow.location.href).toBe('/issues/123/edit');
+        expect(screen.getByRole('button', { name: /loading|saving/i })).toBeDisabled();
+
+        doc.body.innerHTML = '<form id="issue-form"><input type="submit" value="Save" /></form>';
+        const submit = doc.querySelector('input[type="submit"]') as HTMLInputElement;
+        const submitClick = vi.spyOn(submit, 'click');
+        iframeWindow.location.href = 'http://example.com/issues/123/edit';
+        fireEvent.load(iframe);
+        expect(submitClick).toHaveBeenCalledTimes(1);
+
+        fireEvent.load(iframe);
+        expect(submitClick).toHaveBeenCalledTimes(1);
+        expect(screen.getByRole('button', { name: /loading|saving/i })).toBeDisabled();
+    });
+
     it('shows Save comment and submits the active journal edit form', () => {
         const { container } = render(<IssueIframeDialog />);
         const iframe = container.querySelector('iframe') as HTMLIFrameElement;
@@ -266,7 +312,7 @@ describe('IssueIframeDialog', () => {
 
     it('returns to issue detail actions and refreshes data after comment save success', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
 
         const { container } = render(<IssueIframeDialog />);
         const iframe = container.querySelector('iframe') as HTMLIFrameElement;
@@ -330,7 +376,7 @@ describe('IssueIframeDialog', () => {
 
     it('finishes comment save when the journal form disappears without an iframe reload', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
 
         const { container } = render(<IssueIframeDialog />);
         const iframe = container.querySelector('iframe') as HTMLIFrameElement;
@@ -369,7 +415,7 @@ describe('IssueIframeDialog', () => {
 
     it('keeps dialog open in issue detail mode when save transitions to issue show even if issue-form remains', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
 
         const { container } = render(<IssueIframeDialog />);
         const iframe = container.querySelector('iframe') as HTMLIFrameElement;
@@ -411,7 +457,7 @@ describe('IssueIframeDialog', () => {
 
     it('keeps dialog open in issue detail mode when save transitions to issue show without issue-form', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
         useUIStore.setState({ issueDialogUrl: '/redmine/issues/123/edit' });
 
         const { container } = render(<IssueIframeDialog />);
@@ -490,7 +536,7 @@ describe('IssueIframeDialog', () => {
 
     it('keeps dialog open and updates header/link when saving from new issue page to issue show', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
         useUIStore.setState({ issueDialogUrl: '/redmine/projects/p1/issues/new' });
 
         const { container } = render(<IssueIframeDialog />);
@@ -572,7 +618,7 @@ describe('IssueIframeDialog', () => {
 
     it('submits the iframe query form from the footer and closes after success', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
         useUIStore.setState({ issueDialogUrl: null, queryDialogUrl: '/queries/1/edit' });
 
         const { container } = render(<IssueIframeDialog />);
@@ -663,7 +709,7 @@ describe('IssueIframeDialog', () => {
 
     it('navigates back to the edit form from issue detail mode', async () => {
         const refreshData = vi.fn().mockResolvedValue(undefined);
-        useTaskStore.setState({ refreshData: refreshData as unknown as () => Promise<void> });
+        useTaskStore.setState({ refreshData: refreshData as unknown as RefreshData });
 
         const { container } = render(<IssueIframeDialog />);
         const iframe = container.querySelector('iframe') as HTMLIFrameElement;

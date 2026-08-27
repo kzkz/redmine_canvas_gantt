@@ -23,6 +23,188 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
   end
 
+  describe '#api_request?' do
+    before do
+      controller.params[:format] = 'json'
+      session[:user_id] = 7
+    end
+
+    it 'uses the Redmine session for JSON requests without explicit API credentials' do
+      expect(controller.send(:api_request?)).to be(false)
+    end
+
+    it 'preserves Redmine API authentication when an API key header is present' do
+      request.headers['X-Redmine-API-Key'] = 'api-key'
+
+      expect(controller.send(:api_request?)).to be(true)
+    end
+
+    it 'preserves Redmine API authentication when an API key parameter is present' do
+      controller.params[:key] = 'api-key'
+
+      expect(controller.send(:api_request?)).to be(true)
+    end
+
+    it 'preserves Redmine API authentication when an authorization header is present' do
+      request.headers['Authorization'] = 'Basic credentials'
+
+      expect(controller.send(:api_request?)).to be(true)
+    end
+
+    it 'preserves Redmine API authentication when no session user is present' do
+      session.delete(:user_id)
+
+      expect(controller.send(:api_request?)).to be(true)
+    end
+  end
+
+  describe '#normalize_task_date_attributes!' do
+    it 'canonicalizes both finite endpoints through the project calendar interval' do
+      resolver = instance_double(RedmineCanvasGantt::ProjectCalendarResolver)
+      allow(controller).to receive(:business_calendar_resolver).and_return(resolver)
+      allow(resolver).to receive(:normalize_date_interval)
+        .with(
+          start_date: '2027-01-04',
+          due_date: '2027-01-04',
+          changed_fields: %i[start_date due_date],
+          project: project,
+          mode: :legacy_unspecified
+        )
+        .and_return(
+          valid: true,
+          start_date: Date.new(2027, 1, 5),
+          due_date: Date.new(2027, 1, 5)
+        )
+
+      issue = instance_double(
+        Issue,
+        project: project,
+        start_date: Date.new(2027, 1, 4),
+        due_date: Date.new(2027, 1, 4)
+      )
+      attributes = { start_date: '2027-01-04', due_date: '2027-01-04' }
+
+      controller.send(:normalize_task_date_attributes!, attributes, issue)
+
+      expect(attributes).to eq(
+        start_date: Date.new(2027, 1, 5),
+        due_date: Date.new(2027, 1, 5)
+      )
+    end
+  end
+
+  describe '#preprocess_draft_intent' do
+    it 'validates a requested parent through the shared preview and mutation preprocessing' do
+      issue = instance_double(Issue, project: project, project_id: project.id)
+      parent = instance_double(Issue, id: 11)
+      allow(controller).to receive(:performed?).and_return(false)
+      expect(controller).to receive(:load_parent_issue).with(issue, '11').and_return(parent)
+
+      expect(controller.send(:preprocess_draft_intent, issue, parent_issue_id: '11')).to eq(
+        parent_issue_id: '11'
+      )
+    end
+
+    it 'normalizes Preview dates with the same transport mode as PATCH' do
+      resolver = instance_double(RedmineCanvasGantt::ProjectCalendarResolver)
+      allow(controller).to receive(:business_calendar_resolver).and_return(resolver)
+      allow(resolver).to receive(:normalize_date_interval)
+        .with(
+          start_date: '2027-01-04',
+          due_date: '2027-01-04',
+          changed_fields: %i[start_date due_date],
+          project: project,
+          mode: :project_move
+        ).and_return(valid: true, start_date: Date.new(2027, 1, 5), due_date: Date.new(2027, 1, 5))
+
+      issue = instance_double(
+        Issue,
+        project: project,
+        project_id: project.id,
+        start_date: Date.new(2027, 1, 4),
+        due_date: Date.new(2027, 1, 4)
+      )
+      intent = {
+        start_date: '2027-01-04',
+        due_date: '2027-01-04',
+        date_update_mode: 'project_move'
+      }
+
+      expect(controller.send(:preprocess_draft_intent, issue, intent)).to eq(
+        start_date: Date.new(2027, 1, 5),
+        due_date: Date.new(2027, 1, 5)
+      )
+    end
+
+    it 'does not resolve or normalize a destination calendar before scope authorization' do
+      target = instance_double(Project, id: 2)
+      resolver = instance_double(RedmineCanvasGantt::ProjectCalendarResolver)
+      allow(controller).to receive(:business_calendar_resolver).and_return(resolver)
+      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [project.id])
+      allow(Project).to receive_message_chain(:visible, :find_by).with(id: 2).and_return(target)
+      allow(User.current).to receive(:allowed_to?).with(:add_issues, target).and_return(true)
+      expect(resolver).not_to receive(:normalize_date_interval)
+
+      issue = instance_double(Issue, project: project, project_id: project.id, start_date: nil, due_date: nil)
+      result = controller.send(
+        :preprocess_draft_intent,
+        issue,
+        project_id: 2, start_date: '2027-01-04', date_update_mode: 'project_move'
+      )
+
+      expect(result).to eq(project_id: 2, start_date: '2027-01-04')
+    end
+
+    it 'does not inspect a parent before destination project authorization' do
+      target = instance_double(Project, id: 2)
+      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [project.id])
+      allow(Project).to receive_message_chain(:visible, :find_by).with(id: 2).and_return(target)
+      allow(User.current).to receive(:allowed_to?).with(:add_issues, target).and_return(true)
+      expect(controller).not_to receive(:load_parent_issue)
+
+      issue = instance_double(Issue, project: project, project_id: project.id)
+      result = controller.send(
+        :preprocess_draft_intent,
+        issue,
+        project_id: 2, parent_issue_id: 11, start_date: '2027-01-04', date_update_mode: 'project_move'
+      )
+
+      expect(result).to eq(project_id: 2, parent_issue_id: 11, start_date: '2027-01-04')
+    end
+  end
+
+  describe '#business_calendar_revision_required?' do
+    def calendar_revision_required_for(action, payload = {})
+      allow(controller).to receive(:action_name).and_return(action.to_s)
+      controller.params.merge!(payload)
+      controller.send(:business_calendar_revision_required?)
+    end
+
+    it 'classifies task preview and update by date intent instead of action name' do
+      expect(calendar_revision_required_for(:update, task: { subject: 'Renamed' })).to be(false)
+      expect(calendar_revision_required_for(:update, task: { status_id: 2 })).to be(false)
+      expect(calendar_revision_required_for(:update, task: { assigned_to_id: 7 })).to be(false)
+      expect(calendar_revision_required_for(:update, task: { custom_field_values: { '1' => 'A' } })).to be(false)
+      expect(calendar_revision_required_for(:update, task: { start_date: '2027-01-04' })).to be(true)
+      expect(calendar_revision_required_for(:edit_meta_preview, task: { due_date: '2027-01-05' })).to be(true)
+      expect(calendar_revision_required_for(:edit_meta_preview, task: { project_id: 2 })).to be(false)
+    end
+
+    it 'classifies relation mutations through the existing delay relation semantics' do
+      expect(calendar_revision_required_for(:create_relation, relation: { relation_type: 'precedes' })).to be(true)
+      expect(calendar_revision_required_for(:update_relation, relation: { relation_type: 'follows' })).to be(true)
+      expect(calendar_revision_required_for(:create_relation, relation: { relation_type: 'relates' })).to be(false)
+      expect(calendar_revision_required_for(:update_relation, relation: { relation_type: 'blocks' })).to be(false)
+      expect(calendar_revision_required_for(:update_relation, relation: { relation_type: 'blocked' })).to be(false)
+    end
+
+    it 'keeps schedule mutations sensitive and current bulk subtasks independent' do
+      expect(calendar_revision_required_for(:schedule_mutation)).to be(true)
+      expect(calendar_revision_required_for(:bulk_create_subtasks)).to be(false)
+      expect(calendar_revision_required_for(:destroy_relation)).to be(false)
+    end
+  end
+
   describe '#safe_build_asset_path' do
     around do |example|
       Dir.mktmpdir do |dir|
@@ -71,6 +253,63 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(JSON.parse(response.body)).to eq('error' => 'Permission denied')
     end
 
+    it 'requires view permission before a direct mutation API request is processed' do
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(:@permissions, { editable: true, viewable: false, baseline_editable: true })
+      end
+      expect(Issue).not_to receive(:visible)
+
+      patch :update, params: { project_id: 'demo', id: '10', task: { subject: 'Denied' } }, format: :json
+
+      expect(response).to have_http_status(:forbidden)
+      expect(JSON.parse(response.body)).to eq('error' => 'Permission denied')
+    end
+
+    it 'logs unexpected failures without exposing their details to the client' do
+      resolver = instance_double(RedmineCanvasGantt::QueryStateResolver)
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(:@permissions, { editable: true, viewable: true, baseline_editable: true })
+      end
+      allow(controller).to receive(:descendant_project_ids).and_return([1])
+      allow(controller).to receive(:query_state_resolver).and_return(resolver)
+      allow(resolver).to receive(:resolve).and_raise(StandardError, 'database connection details')
+      expect(Rails.logger).to receive(:error).with(include('database connection details'))
+
+      get :data, params: { project_id: 'demo' }, format: :json
+
+      expect(response).to have_http_status(:internal_server_error)
+      expect(response.body).not_to include('database connection details')
+      expect(JSON.parse(response.body).fetch('error')).to include('request ID:')
+    end
+
+    it 'returns 413 when a data collection exceeds its finite budget' do
+      resolver = instance_double(RedmineCanvasGantt::QueryStateResolver)
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(
+          :@permissions,
+          { editable: true, viewable: true, baseline_editable: true }
+        )
+      end
+      allow(controller).to receive(:descendant_project_ids).and_return([1])
+      allow(controller).to receive(:query_state_resolver).and_return(resolver)
+      allow(resolver).to receive(:resolve).and_raise(
+        RedmineCanvasGantt::DataPayloadBudget::Exceeded.new(
+          resource: 'issues',
+          limit: 10_000,
+          actual: 10_001
+        )
+      )
+
+      get :data, params: { project_id: 'demo' }, format: :json
+
+      expect(response).to have_http_status(413)
+      expect(JSON.parse(response.body)).to include(
+        'code' => 'canvas_gantt_payload_limit',
+        'resource' => 'issues',
+        'limit' => 10_000
+      )
+    end
+
     it 'returns data payload with expected top-level keys' do
       payload_builder = instance_double(RedmineCanvasGantt::DataPayloadBuilder)
       baseline_repository = instance_double(RedmineCanvasGantt::BaselineRepository)
@@ -94,7 +333,8 @@ RSpec.describe CanvasGanttsController, type: :controller do
       allow(controller).to receive(:filter_option_issues).with([1, 2]).and_return([filter_option_issue])
       allow(controller).to receive(:query_state_resolver).and_return(resolver)
       allow(controller).to receive(:baseline_repository).and_return(baseline_repository)
-      issue = double('Issue', project_id: 1)
+      allow(controller).to receive(:visible_baseline_snapshot).with(baseline_snapshot, [1, 2]).and_return(baseline_snapshot)
+      issue = double('Issue', id: 10, project_id: 1)
       allow(resolver).to receive(:resolve).and_return({
         issues: [issue],
         initial_state: { query_id: 7 },
@@ -157,7 +397,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
       resolver = instance_double(RedmineCanvasGantt::QueryStateResolver)
       filter_option_project = double('ProjectOption', id: 1, name: 'Demo')
       filter_option_issue = double('FilterOptionIssue')
-      issue = double('Issue', project_id: 1)
+      issue = double('Issue', id: 10, project_id: 1)
 
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true, baseline_editable: true })
@@ -198,11 +438,52 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
   end
 
+  describe '#data_relations' do
+    it 'loads only internal relations through the relation budget' do
+      budget = instance_double(RedmineCanvasGantt::DataPayloadBudget, relation_limit: 2)
+      relation_scope = double('relation scope')
+      ordered_scope = double('ordered relation scope')
+      issues = [instance_double(Issue, id: 10), instance_double(Issue, id: 11)]
+      allow(controller).to receive(:data_payload_budget).and_return(budget)
+      expect(IssueRelation).to receive(:where)
+        .with(issue_from_id: [10, 11], issue_to_id: [10, 11])
+        .and_return(relation_scope)
+      expect(relation_scope).to receive(:order).with(:id).and_return(ordered_scope)
+      expect(budget).to receive(:load_records)
+        .with(ordered_scope, resource: 'relations', limit: 2)
+        .and_return([:relation])
+
+      expect(controller.send(:data_relations, issues)).to eq([:relation])
+    end
+  end
+
+  describe '#render_data_payload_limit' do
+    it 'returns a stable 413 contract without a partial payload' do
+      allow(controller).to receive(:canvas_gantt_l).and_return('Data is too large')
+      error = RedmineCanvasGantt::DataPayloadBudget::Exceeded.new(
+        resource: 'relations',
+        limit: 2,
+        actual: 3
+      )
+      controller.response = ActionDispatch::TestResponse.create
+      controller.instance_variable_set(:@_response_body, nil)
+
+      controller.send(:render_data_payload_limit, error)
+
+      expect(controller.response).to have_http_status(413)
+      expect(JSON.parse(controller.response.body)).to eq(
+        'error' => 'Data is too large',
+        'code' => 'canvas_gantt_payload_limit',
+        'resource' => 'relations',
+        'limit' => 2
+      )
+    end
+  end
+
   describe '#current_view_scope' do
-    it 'builds operation scope without member-project narrowing' do
+    it 'builds only the operation project boundary without resolving the Issue collection' do
       user = instance_double(User)
       view_scope_resolver = instance_double(RedmineCanvasGantt::ViewScopeResolver)
-      resolved_scope = { issue_ids: Set[], scope_project_ids: [1, 2], visible_project_ids: [] }
 
       allow(User).to receive(:current).and_return(user)
       controller.instance_variable_set(:@project, project)
@@ -212,9 +493,10 @@ RSpec.describe CanvasGanttsController, type: :controller do
         current_user: user,
         issue_includes: CanvasGanttsController::ISSUE_INCLUDES
       ).and_return(view_scope_resolver)
-      allow(view_scope_resolver).to receive(:resolve).and_return(resolved_scope)
+      expect(view_scope_resolver).to receive(:project_scope_ids).and_return([1, 2])
+      expect(view_scope_resolver).not_to receive(:resolve)
 
-      expect(controller.send(:current_view_scope)).to eq(resolved_scope)
+      expect(controller.send(:current_view_scope)).to eq(scope_project_ids: [1, 2])
     end
   end
 
@@ -231,6 +513,13 @@ RSpec.describe CanvasGanttsController, type: :controller do
     let(:member_project) { double('ProjectOption', id: 3) }
 
     before do
+      budget = instance_double(RedmineCanvasGantt::DataPayloadBudget, collection_limit: 10_000)
+      allow(controller).to receive(:data_payload_budget).and_return(budget)
+      allow(budget).to receive(:load_records) do |scope, resource:, limit:|
+        expect(resource).to eq('projects')
+        expect(limit).to eq(10_000)
+        scope.to_a
+      end
       allow(Project).to receive(:visible).and_return(visible_scope)
       allow(visible_scope).to receive(:active).and_return(member_active_scope)
       allow(member_active_scope).to receive(:where).with(id: [1, 2]).and_return(tree_project_scope)
@@ -283,7 +572,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
   end
 
   describe 'GET #queries' do
-    let(:current_user) { instance_double(User, id: 7) }
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
     let(:visible_query) do
       instance_double(IssueQuery, id: 12, name: 'Open issues', visibility: 2, project_id: 1)
     end
@@ -293,6 +582,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
 
     before do
       allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
     end
 
     it 'returns forbidden when view permission is missing' do
@@ -332,7 +622,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
   describe 'POST #save_baseline' do
     let(:baseline_repository) { instance_double(RedmineCanvasGantt::BaselineRepository) }
     let(:resolver) { instance_double(RedmineCanvasGantt::QueryStateResolver) }
-    let(:current_user) { instance_double(User, id: 7, name: 'Alice') }
+    let(:current_user) { instance_double(User, id: 7, name: 'Alice', logged?: true, login: 'alice', language: 'en') }
     let(:baseline_snapshot) do
       RedmineCanvasGantt::BaselineSnapshot.new(
         snapshot_id: 'baseline-1',
@@ -356,7 +646,8 @@ RSpec.describe CanvasGanttsController, type: :controller do
       allow(controller).to receive(:query_state_resolver).and_return(resolver)
       allow(controller).to receive(:descendant_project_ids).and_return([1])
       allow(User).to receive(:current).and_return(current_user)
-      allow(current_user).to receive(:allowed_to?).with(:edit_canvas_gantt, project).and_return(true)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
+      allow(current_user).to receive(:allowed_to?).with(:manage_canvas_gantt_baseline, project).and_return(true)
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true, baseline_editable: true })
       end
@@ -394,6 +685,25 @@ RSpec.describe CanvasGanttsController, type: :controller do
         'baseline_due_date' => '2026-04-15'
       )
       expect(body['warnings']).to eq(['query warning'])
+    end
+
+    it 'returns 413 for filtered baseline overflow without building a broader fallback snapshot' do
+      overflow = RedmineCanvasGantt::DataPayloadBudget::Exceeded.new(
+        resource: 'issues',
+        limit: 10_000,
+        actual: 10_001
+      )
+      allow(resolver).to receive(:resolve).and_raise(overflow)
+      expect(baseline_repository).not_to receive(:build_snapshot)
+
+      post :save_baseline, params: { project_id: 'demo', scope: 'filtered' }, format: :json
+
+      expect(response).to have_http_status(413)
+      expect(JSON.parse(response.body)).to include(
+        'code' => 'canvas_gantt_payload_limit',
+        'resource' => 'issues',
+        'limit' => 10_000
+      )
     end
 
     it 'can save a whole-project baseline snapshot' do
@@ -446,12 +756,35 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
 
     it 'returns forbidden when edit permission is missing' do
-      allow(current_user).to receive(:allowed_to?).with(:edit_canvas_gantt, project).and_return(false)
+      allow(current_user).to receive(:allowed_to?).with(:manage_canvas_gantt_baseline, project).and_return(false)
 
       post :save_baseline, params: { project_id: 'demo' }, format: :json
 
       expect(response).to have_http_status(:forbidden)
       expect(JSON.parse(response.body)).to eq('error' => 'Permission denied')
+    end
+  end
+
+  describe '#visible_baseline_snapshot' do
+    it 'excludes private, permission-revoked, and hidden-subproject issue states from the payload' do
+      snapshot = RedmineCanvasGantt::BaselineSnapshot.new(
+        snapshot_id: 'baseline-1', project_id: 1, captured_at: Time.utc(2026, 7, 27),
+        captured_by_id: 7, captured_by_name: 'Alice', scope: 'project',
+        task_states: [
+          RedmineCanvasGantt::BaselineTaskState.new(issue_id: 10, baseline_start_date: Date.new(2026, 7, 1), baseline_due_date: Date.new(2026, 7, 2)),
+          RedmineCanvasGantt::BaselineTaskState.new(issue_id: 11, baseline_start_date: Date.new(2026, 7, 3), baseline_due_date: Date.new(2026, 7, 4)),
+          RedmineCanvasGantt::BaselineTaskState.new(issue_id: 12, baseline_start_date: Date.new(2026, 7, 5), baseline_due_date: Date.new(2026, 7, 6))
+        ]
+      )
+      visible_scope = instance_double(ActiveRecord::Relation)
+      filtered_scope = instance_double(ActiveRecord::Relation)
+      allow(Issue).to receive(:visible).and_return(visible_scope)
+      expect(visible_scope).to receive(:where).with(project_id: [1, 2], id: [10, 11, 12]).and_return(filtered_scope)
+      allow(filtered_scope).to receive(:pluck).with(:id).and_return([10])
+
+      visible_snapshot = controller.send(:visible_baseline_snapshot, snapshot, [1, 2])
+
+      expect(visible_snapshot.to_payload_hash[:tasks_by_issue_id].keys).to eq(['10'])
     end
   end
 
@@ -479,7 +812,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
         'inline_edit_custom_fields',
         'row_height'
       )
-      i18n_payload = controller.instance_variable_get(:@i18n)
+      i18n_payload = controller.instance_variable_get(:@i18n).stringify_keys
       expect(i18n_payload['label_row_height']).to eq(canvas_gantt_t(:label_row_height))
       expect(i18n_payload['label_row_height_m']).to eq(canvas_gantt_t(:label_row_height_m))
       expect(i18n_payload['help_desc_zoom_wheel']).to eq(canvas_gantt_t(:help_desc_zoom_wheel))
@@ -517,7 +850,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
         get :index, params: { project_id: 'demo' }
 
         expect(response).to have_http_status(:ok)
-        i18n_payload = controller.instance_variable_get(:@i18n)
+      i18n_payload = controller.instance_variable_get(:@i18n).stringify_keys
         expect(i18n_payload['label_help']).to eq(canvas_gantt_t(:label_help))
         expect(i18n_payload['help_label_layout_filters']).to eq(canvas_gantt_t(:help_label_layout_filters))
         expect(i18n_payload['help_label_timeline_view']).to eq(canvas_gantt_t(:help_label_timeline_view))
@@ -553,7 +886,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
         get :index, params: { project_id: 'demo' }
 
         expect(response).to have_http_status(:ok)
-        i18n_payload = controller.instance_variable_get(:@i18n)
+      i18n_payload = controller.instance_variable_get(:@i18n).stringify_keys
         expect(i18n_payload['label_help']).to eq(canvas_gantt_t(:label_help))
         expect(i18n_payload['help_label_layout_filters']).to eq(canvas_gantt_t(:help_label_layout_filters))
         expect(i18n_payload['help_label_timeline_view']).to eq(canvas_gantt_t(:help_label_timeline_view))
@@ -582,7 +915,9 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
   end
 
-  describe 'GET #edit_meta' do
+  describe 'GET #edit_meta and POST #edit_meta_preview' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
+    let(:edit_meta_payload_builder) { double('EditMetaPayloadBuilder') }
     let(:issue_scope) { double('IssueScope') }
     let(:issue_project) do
       instance_double(Project, id: 99, issue_categories: [], trackers: [])
@@ -599,6 +934,22 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
 
     before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
+      allow(current_user).to receive(:allowed_to?).with(:edit_issues, issue_project).and_return(true)
+      allow(controller).to receive(:edit_meta_payload_builder).and_return(edit_meta_payload_builder)
+      allow(edit_meta_payload_builder).to receive(:task_payload).with(issue).and_return({ id: issue.id })
+      allow(edit_meta_payload_builder).to receive(:resolved_project_options).and_return([])
+      allow(edit_meta_payload_builder).to receive(:build) do |issue:, capability_issue:, draft_contract: nil, **|
+        payload = {
+          task: { id: issue.id },
+          options: {
+            trackers: Array(capability_issue.allowed_target_trackers(current_user)).map { |tracker| { id: tracker.id, name: tracker.name } }
+          }
+        }
+        payload[:draft_contract] = draft_contract if draft_contract
+        payload
+      end
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true, baseline_editable: false })
       end
@@ -607,8 +958,11 @@ RSpec.describe CanvasGanttsController, type: :controller do
       allow(controller).to receive(:current_view_scope).and_return({ issue_ids: Set[42], scope_project_ids: [1, 99], visible_project_ids: [99] })
       allow(issue).to receive(:new_statuses_allowed_to).and_return([])
       allow(issue).to receive(:assignable_users).and_return([])
+      allow(issue).to receive(:allowed_target_trackers).and_return([])
+      allow(issue).to receive(:assignable_versions).and_return([])
       allow(issue).to receive(:subject).and_return('Scoped issue')
       allow(issue).to receive(:assigned_to_id).and_return(nil)
+      allow(issue).to receive(:assigned_to).and_return(nil)
       allow(issue).to receive(:status_id).and_return(1)
       allow(issue).to receive(:done_ratio).and_return(0)
       allow(issue).to receive(:due_date).and_return(nil)
@@ -638,6 +992,16 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(JSON.parse(response.body).dig('task', 'id')).to eq(42)
     end
 
+    it 'returns scope not_found when edit_meta receives a visible issue outside the Canvas scope' do
+      allow(controller).to receive(:ensure_issue_in_scope).and_call_original
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1] })
+
+      get :edit_meta, params: { project_id: 'demo', id: '42' }, format: :json
+
+      expect(response).to have_http_status(:not_found)
+      expect(JSON.parse(response.body).dig('failure', 'resource_role')).to eq('scope')
+    end
+
     it 'returns destination-project options when target_project_id is authorized' do
       destination_tracker = instance_double(Tracker, id: 7, name: 'Destination tracker')
       destination_project = instance_double(
@@ -647,13 +1011,146 @@ RSpec.describe CanvasGanttsController, type: :controller do
         trackers: [destination_tracker],
         assignable_users: []
       )
-      allow(Project).to receive(:visible).and_return(double(find: destination_project))
-      allow(User.current).to receive(:allowed_to?).with(:add_issues, destination_project).and_return(true)
+      capability_issue = instance_double(
+        Issue,
+        project: destination_project,
+        project_id: 1,
+        tracker_id: 7,
+        status_id: 1,
+        editable?: true,
+        safe_attribute?: true,
+        allowed_target_trackers: [destination_tracker]
+      )
+      evaluation = double(issue: capability_issue, draft_contract: { materialized: { project_id: 1 } }, violations: [])
+      allow(controller).to receive(:issue_draft_evaluator).and_return(double(evaluate: evaluation))
+      allow(current_user).to receive(:allowed_to?).with(:edit_issues, destination_project).and_return(true)
 
       get :edit_meta, params: { project_id: 'demo', id: '42', target_project_id: '1' }, format: :json
 
       expect(response).to have_http_status(:ok)
       expect(JSON.parse(response.body).dig('options', 'trackers')).to eq([{ 'id' => 7, 'name' => 'Destination tracker' }])
+    end
+
+    it 'adapts legacy target_tracker_id and target_status_id through the shared evaluator' do
+      evaluation = double(
+        issue: issue,
+        draft_contract: {
+          base_revision: 1,
+          materialized: { tracker_id: 7, status_id: 2 },
+          normalizations: [],
+          violations: []
+        },
+        violations: []
+      )
+      evaluator = double
+      expect(evaluator).to receive(:evaluate).with(
+        issue: issue,
+        intent: { tracker_id: 7, status_id: 2 }
+      ).and_return(evaluation)
+      allow(controller).to receive(:issue_draft_evaluator).and_return(evaluator)
+
+      get :edit_meta,
+          params: {
+            project_id: 'demo',
+            id: '42',
+            target_tracker_id: '7',
+            target_status_id: '2'
+          },
+          format: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body).dig('draft_contract', 'materialized')).to eq(
+        'tracker_id' => 7,
+        'status_id' => 2
+      )
+    end
+
+    it 'evaluates a field-presence draft through the POST preview endpoint' do
+      contract = {
+        base_revision: 1,
+        materialized: { project_id: 1, tracker_id: 7 },
+        normalizations: [{ field: 'tracker_id', from: nil, to: 7, source: 'policy' }],
+        violations: []
+      }
+      evaluation = double(issue: issue, draft_contract: contract, violations: [])
+      evaluator = double
+      allow(evaluator).to receive(:evaluate).with(
+        issue: issue,
+        intent: { project_id: '1', lock_version: '1' }
+      ).and_return(evaluation)
+      allow(controller).to receive(:issue_draft_evaluator).and_return(evaluator)
+
+      post :edit_meta_preview,
+           params: {
+             project_id: 'demo',
+             id: '42',
+             task: { project_id: '1', lock_version: '1', date_update_mode: 'project_move' }
+           },
+           format: :json
+
+      expect(response).to have_http_status(:ok)
+      body = JSON.parse(response.body)
+      expect(body['task']).to eq('id' => 42)
+      expect(body.dig('draft_contract', 'materialized')).to eq('project_id' => 1, 'tracker_id' => 7)
+    end
+
+    it 'returns a stale preview violation before parent or calendar preprocessing' do
+      expect(controller).not_to receive(:preprocess_draft_intent)
+
+      post :edit_meta_preview,
+           params: {
+             project_id: 'demo',
+             id: '42',
+             task: { parent_issue_id: '42', due_date: 'invalid', lock_version: '0' }
+           },
+           format: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body).dig('draft_contract', 'violations')).to include(
+        include('field' => 'lock_version', 'code' => 'stale_revision')
+      )
+    end
+
+    it 'returns preview domain violations in the additive draft contract' do
+      contract = {
+        base_revision: 1,
+        materialized: {},
+        normalizations: [],
+        violations: [{ field: 'author_id', code: 'unsupported_field', message: 'The requested field cannot be edited.' }]
+      }
+      evaluation = double(issue: issue, draft_contract: contract, violations: contract[:violations])
+      allow(controller).to receive(:issue_draft_evaluator).and_return(double(evaluate: evaluation))
+
+      post :edit_meta_preview,
+           params: { project_id: 'demo', id: '42', task: { author_id: '9', lock_version: '1' } },
+           format: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body).dig('draft_contract', 'violations')).to include(
+        include('field' => 'author_id', 'code' => 'unsupported_field')
+      )
+    end
+
+    it 'keeps the draft contract and complete preview response within the response-size gates' do
+      get :edit_meta, params: { project_id: 'demo', id: '42' }, format: :json
+      equivalent_response_size = response.body.bytesize
+      contract = {
+        base_revision: 1,
+        materialized: { project_id: 1, tracker_id: 7 },
+        normalizations: [{ field: 'tracker_id', from: nil, to: 7, source: 'policy' }],
+        violations: []
+      }
+      evaluation = double(issue: issue, draft_contract: contract, violations: [])
+      allow(controller).to receive(:issue_draft_evaluator).and_return(double(evaluate: evaluation))
+
+      post :edit_meta_preview,
+           params: { project_id: 'demo', id: '42', task: { project_id: '1', lock_version: '1' } },
+           format: :json
+
+      contract_size = JSON.generate(JSON.parse(response.body).fetch('draft_contract')).bytesize
+      allowed_growth = [8.kilobytes, (equivalent_response_size * 0.1).ceil].max
+      expect(contract_size).to be <= 8.kilobytes
+      expect(response.body.bytesize - equivalent_response_size).to be <= allowed_growth
     end
   end
 
@@ -665,6 +1162,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
         id: 10,
         parent_id: nil,
         project_id: 1,
+        lock_version: 1,
         editable?: true
       )
     end
@@ -675,10 +1173,12 @@ RSpec.describe CanvasGanttsController, type: :controller do
       end
       allow(Issue).to receive(:visible).and_return(issue_scope)
       allow(issue_scope).to receive(:find).with('10').and_return(issue)
+      allow(issue_scope).to receive(:find_by).and_return(nil)
+      allow(controller).to receive(:data_payload_builder).and_return(double(build_task_state: { id: 10 }))
       allow(controller).to receive(:ensure_issue_in_scope).and_return(true)
       allow(controller).to receive(:ensure_issue_editable).and_return(true)
-      allow(controller).to receive(:original_project_move_values).and_return({})
-      allow(controller).to receive(:ensure_project_move_valid!).and_return(true)
+      evaluation = double(valid?: true)
+      allow(controller).to receive(:issue_draft_evaluator).and_return(double(evaluate: evaluation))
     end
 
     it 'returns conflict on stale object error' do
@@ -686,11 +1186,78 @@ RSpec.describe CanvasGanttsController, type: :controller do
       allow(issue).to receive(:safe_attributes=)
       allow(issue).to receive(:save).and_raise(ActiveRecord::StaleObjectError.new(issue, 'update'))
       allow(controller).to receive(:load_parent_issue).and_return(nil)
+      remote_issue = instance_double(Issue, id: 10, lock_version: 4)
+      allow(issue_scope).to receive(:find_by).and_return(remote_issue)
+      allow(controller).to receive(:data_payload_builder).and_return(
+        double(build_task_state: { id: 10, subject: 'Remote', lock_version: 4 })
+      )
 
       patch :update, params: { project_id: 'demo', id: '10', task: { subject: 'Updated', lock_version: 1 } }, format: :json
 
       expect(response).to have_http_status(:conflict)
-      expect(JSON.parse(response.body)['error']).to include('Conflict')
+      body = JSON.parse(response.body)
+      expect(body['status']).to eq('conflict')
+      expect(body['completeness']).to eq('partial')
+      expect(body['entity']).to include('id' => 10, 'lock_version' => 4)
+      expect(body['revision']).to eq(4)
+      expect(body['entity']).not_to have_key('display_order')
+      expect(body['entity']).not_to have_key('editable')
+      expect(body['error']).to include('Conflict')
+      expect(body).not_to have_key('display_order')
+      expect(body).not_to have_key('editable')
+    end
+
+    it 'returns conflict for a stale revision before date preprocessing' do
+      expect(controller).not_to receive(:preprocess_draft_intent)
+
+      patch :update,
+            params: { project_id: 'demo', id: '10', task: { due_date: 'invalid', lock_version: 0 } },
+            format: :json
+
+      expect(response).to have_http_status(:conflict)
+    end
+
+    it 'returns conflict for a stale revision before parent preprocessing' do
+      expect(controller).not_to receive(:preprocess_draft_intent)
+
+      patch :update,
+            params: { project_id: 'demo', id: '10', task: { parent_issue_id: '10', lock_version: 0 } },
+            format: :json
+
+      expect(response).to have_http_status(:conflict)
+    end
+
+    it 'returns scope not_found when a visible target is outside the Canvas mutation scope' do
+      allow(controller).to receive(:ensure_issue_in_scope).and_call_original
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [2] })
+
+      patch :update, params: { project_id: 'demo', id: '10', task: { subject: 'Out of scope', lock_version: 1 } }, format: :json
+
+      expect(response).to have_http_status(:not_found)
+      expect(JSON.parse(response.body)).to include(
+        'status' => 'not_found',
+        'failure' => include(
+          'kind' => 'not_found',
+          'resource_role' => 'scope',
+          'resource_type' => 'task'
+        )
+      )
+    end
+
+    it 'keeps missing visible targets classified as target not_found' do
+      allow(issue_scope).to receive(:find).with('10').and_raise(ActiveRecord::RecordNotFound)
+
+      patch :update, params: { project_id: 'demo', id: '10', task: { subject: 'Missing', lock_version: 1 } }, format: :json
+
+      expect(response).to have_http_status(:not_found)
+      expect(JSON.parse(response.body)).to include(
+        'status' => 'not_found',
+        'failure' => include(
+          'kind' => 'not_found',
+          'resource_role' => 'target',
+          'resource_type' => 'task'
+        )
+      )
     end
 
     it 'returns unprocessable entity when setting itself as parent' do
@@ -721,7 +1288,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
       allow(issue).to receive(:init_journal)
       allow(issue).to receive(:safe_attributes=)
       allow(issue).to receive(:save).and_return(true)
-      allow(issue).to receive(:lock_version).and_return(2)
+      allow(issue).to receive(:lock_version).and_return(1, 2)
       allow(controller).to receive(:load_parent_issue).and_return(nil)
 
       patch :update, params: { project_id: 'demo', id: '10', task: { subject: 'Updated', lock_version: 1 } }, format: :json
@@ -729,11 +1296,144 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(response).to have_http_status(:ok)
       expect(JSON.parse(response.body)['status']).to eq('ok')
     end
+
+    it 'maps evaluator domain violations to an unprocessable mutation response' do
+      violation = { field: 'status_id', code: 'not_accepted', message: 'The requested value was not accepted.' }
+      evaluation = double(
+        valid?: false,
+        violations: [violation],
+        draft_contract: { base_revision: 1, materialized: {}, normalizations: [], violations: [violation] }
+      )
+      allow(controller).to receive(:issue_draft_evaluator).and_return(double(evaluate: evaluation))
+      allow(issue).to receive(:init_journal)
+      allow(controller).to receive(:load_parent_issue).and_return(nil)
+
+      patch :update,
+            params: { project_id: 'demo', id: '10', task: { status_id: '999999', lock_version: '1' } },
+            format: :json
+
+      expect(response).to have_http_status(:unprocessable_entity)
+      expect(JSON.parse(response.body)).to include(
+        'status' => 'validation_error',
+        'errors' => ['The requested value was not accepted.']
+      )
+    end
+  end
+
+  describe '#ensure_issue_in_operation_scope' do
+    let(:issue) { instance_double(Issue, id: 10) }
+
+    before do
+      allow(controller).to receive(:requested_operation_issue_ids).and_return(Set[10])
+      allow(controller).to receive(:mutation_scope_issues).and_return([])
+    end
+
+    it 'classifies operation scope rejection as scope not_found by default' do
+      expect(controller).to receive(:render) do |json:, status:|
+        expect(status).to eq(:not_found)
+        expect(json[:failure]).to include(
+          kind: 'not_found',
+          resource_role: 'scope',
+          resource_type: 'task'
+        )
+      end
+
+      expect(controller.send(:ensure_issue_in_operation_scope, issue)).to be(false)
+    end
+  end
+
+  describe '#issue_editable?' do
+    let(:current_user) { instance_double(User) }
+    let(:canvas_project) { instance_double(Project, id: 1, name: 'Parent') }
+    let(:child_project) { instance_double(Project, id: 2, name: 'Child') }
+    let(:child_issue) { instance_double(Issue, project: child_project, editable?: true) }
+
+    before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
+    end
+
+    it 'uses the target child issue project rather than the canvas project' do
+      allow(current_user).to receive(:allowed_to?).with(:edit_issues, child_project).and_return(true)
+      allow(current_user).to receive(:allowed_to?).with(:edit_issues, canvas_project).and_return(false)
+
+      expect(controller.send(:issue_editable?, child_issue)).to be(true)
+      expect(current_user).to have_received(:allowed_to?).with(:edit_issues, child_project)
+      expect(current_user).not_to have_received(:allowed_to?).with(:edit_issues, canvas_project)
+    end
+  end
+
+  describe 'DELETE #destroy_task' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
+    let(:issue_scope) { double('IssueScope') }
+    let(:issue_project) { instance_double(Project, id: 1) }
+    let(:issue) { instance_double(Issue, id: 10, project_id: 1, parent_id: nil, project: issue_project, deletable?: true) }
+
+    before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
+      end
+      allow(Issue).to receive(:visible).and_return(issue_scope)
+      allow(issue_scope).to receive(:find).with('10').and_return(issue)
+      allow(controller).to receive(:current_view_issue_ids).and_return(Set[10])
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1], issues: [] })
+    end
+
+    it 'deletes an issue and returns ok for an authorized session' do
+      allow(current_user).to receive(:allowed_to?).with(:delete_issues, issue_project).and_return(true)
+      allow(issue).to receive(:destroy)
+
+      delete :destroy_task, params: { project_id: 'demo', id: '10' }, format: :json
+
+      expect(issue).to have_received(:destroy)
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body)).to eq(
+        'status' => 'ok',
+        'completeness' => 'partial',
+        'invalidated_entity_ids' => [10],
+        'deleted_entity_ids' => [10]
+      )
+    end
+
+    it 'returns forbidden without delete permission' do
+      allow(current_user).to receive(:allowed_to?).with(:delete_issues, issue_project).and_return(false)
+
+      delete :destroy_task, params: { project_id: 'demo', id: '10' }, format: :json
+
+      expect(response).to have_http_status(:forbidden)
+      expect(JSON.parse(response.body)).to eq('error' => 'Permission denied')
+    end
+
+    it 'returns scope not_found and does not delete a visible issue outside the Canvas scope' do
+      allow(controller).to receive(:ensure_issue_in_scope).and_call_original
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [2] })
+      allow(issue).to receive(:destroy)
+
+      delete :destroy_task, params: { project_id: 'demo', id: '10' }, format: :json
+
+      expect(response).to have_http_status(:not_found)
+      expect(JSON.parse(response.body).dig('failure', 'resource_role')).to eq('scope')
+      expect(issue).not_to have_received(:destroy)
+    end
+
+    it 'does not use current view membership as mutation authorization' do
+      allow(controller).to receive(:current_view_issue_ids).and_return(Set[])
+      allow(current_user).to receive(:allowed_to?).with(:delete_issues, issue_project).and_return(true)
+      allow(issue).to receive(:destroy)
+
+      delete :destroy_task, params: { project_id: 'demo', id: '10' }, format: :json
+
+      expect(response).to have_http_status(:ok)
+    end
   end
 
   describe 'POST #bulk_create_subtasks' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
     let(:issue_scope) { double('IssueScope') }
-    let(:parent_project) { instance_double(Project, id: 2) }
+    let(:parent_tracker) { instance_double(Tracker, id: 3, name: 'Bug') }
+    let(:parent_project) { instance_double(Project, id: 2, trackers: [parent_tracker]) }
     let(:parent_issue) do
       instance_double(
         Issue,
@@ -750,11 +1450,14 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
 
     before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
       end
       allow(Issue).to receive(:visible).and_return(issue_scope)
       allow(issue_scope).to receive(:find).with('99').and_return(parent_issue)
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [2], issues: [] })
       allow(controller).to receive(:ensure_issue_in_scope).and_return(true)
     end
 
@@ -790,6 +1493,8 @@ RSpec.describe CanvasGanttsController, type: :controller do
 
     it 'returns not found when parent is visible only as a context row outside operation scope' do
       allow(controller).to receive(:current_view_issue_ids).and_return(Set[99, 100])
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [], issues: [] })
+      allow(controller).to receive(:ensure_issue_in_scope).and_call_original
 
       post :bulk_create_subtasks,
            params: {
@@ -801,10 +1506,18 @@ RSpec.describe CanvasGanttsController, type: :controller do
            format: :json
 
       expect(response).to have_http_status(:not_found)
-      expect(JSON.parse(response.body)).to eq('error' => 'Issue not found in project')
+      expect(JSON.parse(response.body)).to include(
+        'error' => 'Issue not found in this project',
+        'status' => 'not_found',
+        'failure' => include(
+          'kind' => 'not_found',
+          'resource_role' => 'reference',
+          'resource_type' => 'parent_task'
+        )
+      )
     end
 
-    it 'creates subtasks with inherited fields and reports partial failure' do
+    it 'rolls back all subtasks when one row fails' do
       allow(User.current).to receive(:allowed_to?).with(:add_issues, parent_project).and_return(true)
       allow(User.current).to receive(:allowed_to?).with(:manage_subtasks, parent_project).and_return(true)
 
@@ -837,9 +1550,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
         tracker_id: 3,
         status_id: 4,
         priority_id: 5,
-        assigned_to_id: 6,
-        fixed_version_id: 7,
-        category_id: 8
+        assigned_to_id: 6
       ))
       expect(failed_issue).to have_received(:safe_attributes=).with(hash_including(
         subject: 'Task B',
@@ -851,10 +1562,10 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(response).to have_http_status(:ok)
       body = JSON.parse(response.body)
       expect(body['status']).to eq('ok')
-      expect(body['success_count']).to eq(1)
-      expect(body['fail_count']).to eq(1)
-      expect(body['results'].map { |r| r['status'] }).to eq(['ok', 'error'])
-      expect(body['results'][0]['issue_id']).to eq(501)
+      expect(body['success_count']).to eq(0)
+      expect(body['fail_count']).to eq(2)
+      expect(body['results'].map { |r| r['status'] }).to eq(['error', 'error'])
+      expect(body['results'][0]['errors']).to eq(['No child tickets were created because another row failed'])
       expect(body['results'][1]['errors']).to eq(['Subject is invalid'])
     end
 
@@ -888,22 +1599,64 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
   end
 
+  describe 'GET #subtask_trackers' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
+    let(:issue_scope) { double('IssueScope') }
+    let(:tracker) { instance_double(Tracker, id: 3, name: 'Bug') }
+    let(:parent_project) { instance_double(Project, trackers: [tracker]) }
+    let(:parent_issue) { instance_double(Issue, id: 99, project: parent_project) }
+
+    before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
+      end
+      allow(Issue).to receive(:visible).and_return(issue_scope)
+      allow(issue_scope).to receive(:find).with('99').and_return(parent_issue)
+      allow(controller).to receive(:ensure_issue_in_scope).and_return(true)
+      allow(controller).to receive(:ensure_issue_in_operation_scope).and_return(true)
+    end
+
+    it 'returns the trackers available to the parent project' do
+      get :subtask_trackers,
+          params: { project_id: 'demo', parent_issue_id: '99', operation_issue_ids: [99] },
+          format: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body)).to eq('trackers' => [{ 'id' => 3, 'name' => 'Bug' }])
+    end
+  end
+
   describe 'PATCH #update_relation' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
+    let(:issue_scope) { double('IssueScope') }
     let(:relation) { instance_double(IssueRelation, id: 77, issue_from_id: 10, issue_to_id: 11, save: true) }
     let(:project_from) { instance_double(Project, id: 1) }
     let(:project_to) { instance_double(Project, id: 2) }
-    let(:issue_from) { instance_double(Issue, id: 10, project_id: 1, project: project_from, editable?: true) }
-    let(:issue_to) { instance_double(Issue, id: 11, project_id: 2, project: project_to, editable?: true) }
+    let(:issue_from) { instance_double(Issue, id: 10, project_id: 1, project: project_from, editable?: true, relations: []) }
+    let(:issue_to) { instance_double(Issue, id: 11, project_id: 2, project: project_to, editable?: true, relations: []) }
 
     before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
       end
       allow(controller).to receive(:current_view_issue_ids).and_return(Set[10, 11])
-      allow(controller).to receive(:current_view_scope).and_return({ issues: [] })
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1, 2, 3], issues: [] })
+      allow(controller).to receive(:mutation_scope_issues).and_return([issue_from, issue_to])
       allow(IssueRelation).to receive(:find).with('77').and_return(relation)
+      allow(relation).to receive(:id).and_return(77)
+      allow(relation).to receive(:issue_from_id).and_return(10)
+      allow(relation).to receive(:issue_to_id).and_return(11)
       allow(relation).to receive(:issue_from).and_return(issue_from)
       allow(relation).to receive(:issue_to).and_return(issue_to)
+      allow(Issue).to receive(:visible).and_return(issue_scope)
+      allow(issue_scope).to receive(:find).with(10).and_return(issue_from)
+      allow(issue_scope).to receive(:find).with(11).and_return(issue_to)
+      allow(issue_from).to receive(:due_date).and_return(Date.new(2026, 1, 2))
+      allow(issue_to).to receive(:start_date).and_return(Date.new(2026, 1, 7))
       allow(relation).to receive(:errors).and_return(double(full_messages: ['Save failed']))
       allow(Setting).to receive(:non_working_week_days).and_return(['6', '7'])
       allow(User.current).to receive(:allowed_to?).with(:edit_issues, project_from).and_return(true)
@@ -925,6 +1678,8 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(response).to have_http_status(:ok)
       expect(JSON.parse(response.body)).to eq(
         'status' => 'ok',
+        'completeness' => 'complete',
+        'invalidated_entity_ids' => [10, 11],
         'relation' => {
           'id' => 77,
           'from' => 10,
@@ -948,13 +1703,23 @@ RSpec.describe CanvasGanttsController, type: :controller do
     it 'returns not found when relation is outside the current project' do
       allow(relation).to receive(:issue_from).and_return(instance_double(Issue, id: 30, project_id: 3, project: project_from, editable?: true))
       allow(relation).to receive(:issue_to).and_return(instance_double(Issue, id: 40, project_id: 4, project: project_to, editable?: true))
+      allow(issue_scope).to receive(:find).with(10).and_return(instance_double(Issue, id: 30, project_id: 3, project: project_from, editable?: true))
+      allow(issue_scope).to receive(:find).with(11).and_return(instance_double(Issue, id: 40, project_id: 4, project: project_to, editable?: true))
 
       patch :update_relation,
             params: { project_id: 'demo', id: '77', relation: { relation_type: 'blocks' } },
             format: :json
 
       expect(response).to have_http_status(:not_found)
-      expect(JSON.parse(response.body)).to eq('error' => 'Relation not found in this project')
+      expect(JSON.parse(response.body)).to include(
+        'error' => 'Relation not found in this project',
+        'status' => 'not_found',
+        'failure' => include(
+          'kind' => 'not_found',
+          'resource_role' => 'relation',
+          'resource_type' => 'relation'
+        )
+      )
     end
 
     it 'rejects an invalid relation type' do
@@ -1018,7 +1783,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
     it 'rejects relation updates that would create a scheduling cycle' do
       allow(issue_from).to receive(:editable?).and_return(true)
       existing_relations = [{ id: '12', from: 11, to: 10, type: 'precedes', delay: 0 }]
-      allow(controller).to receive(:current_view_scope).and_return({ issues: [double('Issue')] })
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1, 2, 3], issues: [double('Issue')] })
       allow(controller).to receive(:build_relations).and_return(existing_relations)
 
       patch :update_relation,
@@ -1042,24 +1807,30 @@ RSpec.describe CanvasGanttsController, type: :controller do
   end
 
   describe 'POST #create_relation' do
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
     let(:issue_scope) { double('IssueScope') }
     let(:issue_project) { instance_double(Project, id: 1) }
-    let(:issue_from) { instance_double(Issue, id: 10, project_id: 1, project: issue_project, editable?: true, due_date: Date.new(2026, 1, 2), start_date: Date.new(2026, 1, 1)) }
-    let(:issue_to) { instance_double(Issue, id: 11, project_id: 1, project: issue_project, editable?: true, due_date: Date.new(2026, 1, 5), start_date: Date.new(2026, 1, 4)) }
+    let(:issue_from) { instance_double(Issue, id: 10, project_id: 1, project: issue_project, editable?: true, due_date: Date.new(2026, 1, 2), start_date: Date.new(2026, 1, 1), relations: []) }
+    let(:issue_to) { instance_double(Issue, id: 11, project_id: 1, project: issue_project, editable?: true, due_date: Date.new(2026, 1, 8), start_date: Date.new(2026, 1, 7), relations: []) }
     let(:relation) { instance_double(IssueRelation, id: 88, issue_from_id: 10, issue_to_id: 11, relation_type: 'precedes', delay: 2, save: true) }
 
     before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
       end
       allow(controller).to receive(:current_view_issue_ids).and_return(Set[10, 11])
-      allow(controller).to receive(:current_view_scope).and_return({ issues: [] })
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1, 2, 3], issues: [] })
+      allow(controller).to receive(:mutation_scope_issues).and_return([issue_from, issue_to])
       allow(Issue).to receive(:visible).and_return(issue_scope)
       allow(issue_scope).to receive(:find).with('10').and_return(issue_from)
       allow(issue_scope).to receive(:find).with('11').and_return(issue_to)
       allow(IssueRelation).to receive(:new).and_return(relation)
+      allow(relation).to receive(:relation_type=)
+      allow(relation).to receive(:delay=)
       allow(Setting).to receive(:non_working_week_days).and_return(['6', '7'])
-      allow(User.current).to receive(:allowed_to?).with(:edit_issues, kind_of(Project)).and_return(true)
+      allow(User.current).to receive(:allowed_to?).with(:edit_issues, issue_project).and_return(true)
     end
 
     it 'creates a relation when delay matches current task dates' do
@@ -1070,6 +1841,8 @@ RSpec.describe CanvasGanttsController, type: :controller do
       expect(response).to have_http_status(:ok)
       expect(JSON.parse(response.body)).to eq(
         'status' => 'ok',
+        'completeness' => 'complete',
+        'invalidated_entity_ids' => [10, 11],
         'relation' => {
           'id' => 88,
           'from' => 10,
@@ -1090,7 +1863,7 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
 
     it 'rejects relation creation that would create a scheduling cycle' do
-      allow(controller).to receive(:current_view_scope).and_return({ issues: [double('Issue')] })
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1, 2, 3], issues: [double('Issue')] })
       allow(controller).to receive(:build_relations).and_return([
         { id: '12', from: 11, to: 10, type: 'precedes', delay: 0 }
       ])
@@ -1114,19 +1887,57 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
   end
 
+  describe '#save_relation_change business calendar fallback' do
+    let(:relation) { instance_double(IssueRelation, id: 77, issue_from_id: 10, issue_to_id: 11) }
+    let(:issue_from) { instance_double(Issue) }
+    let(:issue_to) { instance_double(Issue) }
+
+    it 'continues saving a delay relation when calendar configuration is invalid' do
+      allow(controller).to receive(:ensure_editable_relation_type!).and_return(true)
+      allow(controller).to receive(:relation_params).and_return({ relation_type: 'precedes' })
+      allow(controller).to receive(:normalized_relation_delay).and_return(0)
+      allow(controller).to receive(:performed?).and_return(false)
+      allow(controller).to receive(:ensure_relation_change_valid!).and_return(true)
+      allow(controller).to receive(:business_calendar_resolver).and_return(
+        instance_double(RedmineCanvasGantt::ProjectCalendarResolver, configuration_error?: true)
+      )
+      allow(controller).to receive(:render_relation_save_result)
+      allow(relation).to receive(:relation_type=)
+      allow(relation).to receive(:delay=)
+
+      controller.send(
+        :save_relation_change,
+        relation: relation,
+        issue_from: issue_from,
+        issue_to: issue_to,
+        relation_id: '77'
+      )
+
+      expect(controller).to have_received(:render_relation_save_result).with(relation)
+    end
+  end
+
   describe 'DELETE #destroy_relation' do
-    let(:relation) { instance_double(IssueRelation) }
+    let(:current_user) { instance_double(User, id: 7, logged?: true, login: 'tester', language: 'en') }
+    let(:issue_scope) { double('IssueScope') }
+    let(:relation) { instance_double(IssueRelation, id: 77, issue_from_id: 10, issue_to_id: 11) }
     let(:project_from) { instance_double(Project, id: 1) }
     let(:project_to) { instance_double(Project, id: 2) }
     let(:issue_from) { instance_double(Issue, id: 10, project_id: 1, project: project_from, editable?: false) }
     let(:issue_to) { instance_double(Issue, id: 11, project_id: 2, project: project_to, editable?: true) }
 
     before do
+      allow(User).to receive(:current).and_return(current_user)
+      allow(current_user).to receive(:allowed_to?).and_return(false)
       allow(controller).to receive(:set_permissions) do
         controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
       end
       allow(controller).to receive(:current_view_issue_ids).and_return(Set[10, 11])
+      allow(controller).to receive(:current_view_scope).and_return({ scope_project_ids: [1, 2, 3], issues: [] })
       allow(IssueRelation).to receive(:find).with('77').and_return(relation)
+      allow(Issue).to receive(:visible).and_return(issue_scope)
+      allow(issue_scope).to receive(:find).with(10).and_return(issue_from)
+      allow(issue_scope).to receive(:find).with(11).and_return(issue_to)
       allow(relation).to receive(:issue_from).and_return(issue_from)
       allow(relation).to receive(:issue_to).and_return(issue_to)
       allow(User.current).to receive(:allowed_to?).with(:edit_issues, project_from).and_return(false)
@@ -1134,15 +1945,22 @@ RSpec.describe CanvasGanttsController, type: :controller do
     end
 
     it 'destroys a relation when either side belongs to a descendant project' do
-      allow(relation).to receive(:issue_from).and_return(instance_double(Issue, id: 10, project_id: 2, project: project_from, editable?: true))
-      allow(relation).to receive(:issue_to).and_return(instance_double(Issue, id: 11, project_id: 3, project: project_to, editable?: true))
+      descendant_from = instance_double(Issue, id: 10, project_id: 2, project: project_from, editable?: true)
+      descendant_to = instance_double(Issue, id: 11, project_id: 3, project: project_to, editable?: true)
+      allow(issue_scope).to receive(:find).with(10).and_return(descendant_from)
+      allow(issue_scope).to receive(:find).with(11).and_return(descendant_to)
       allow(User.current).to receive(:allowed_to?).with(:edit_issues, project_from).and_return(true)
       allow(relation).to receive(:destroy)
 
       delete :destroy_relation, params: { project_id: 'demo', id: '77' }, format: :json
 
       expect(response).to have_http_status(:ok)
-      expect(JSON.parse(response.body)).to eq('status' => 'ok')
+      expect(JSON.parse(response.body)).to eq(
+        'status' => 'ok',
+        'completeness' => 'partial',
+        'invalidated_entity_ids' => [10, 11],
+        'deleted_entity_ids' => [77]
+      )
       expect(relation).to have_received(:destroy)
     end
 
@@ -1156,11 +1974,21 @@ RSpec.describe CanvasGanttsController, type: :controller do
     it 'returns not found when relation is outside the current project' do
       allow(relation).to receive(:issue_from).and_return(instance_double(Issue, id: 30, project_id: 3, project: project_from, editable?: true))
       allow(relation).to receive(:issue_to).and_return(instance_double(Issue, id: 40, project_id: 4, project: project_to, editable?: true))
+      allow(issue_scope).to receive(:find).with(10).and_return(instance_double(Issue, id: 30, project_id: 3, project: project_from, editable?: true))
+      allow(issue_scope).to receive(:find).with(11).and_return(instance_double(Issue, id: 40, project_id: 4, project: project_to, editable?: true))
 
       delete :destroy_relation, params: { project_id: 'demo', id: '77' }, format: :json
 
       expect(response).to have_http_status(:not_found)
-      expect(JSON.parse(response.body)).to eq('error' => 'Relation not found in this project')
+      expect(JSON.parse(response.body)).to include(
+        'error' => 'Relation not found in this project',
+        'status' => 'not_found',
+        'failure' => include(
+          'kind' => 'not_found',
+          'resource_role' => 'relation',
+          'resource_type' => 'relation'
+        )
+      )
     end
   end
 
@@ -1174,9 +2002,10 @@ RSpec.describe CanvasGanttsController, type: :controller do
         relation_type: 'precedes',
         delay: 3
       )
-      issue = instance_double(Issue, relations: [relation])
+      issue = instance_double(Issue, id: 10, relations: [relation])
+      related_issue = instance_double(Issue, id: 20, relations: [])
 
-      expect(controller.send(:data_payload_builder).build_relations([issue])).to eq([
+      expect(controller.send(:data_payload_builder).build_relations([issue, related_issue])).to eq([
         {
           id: 50,
           from: 10,
@@ -1197,126 +2026,6 @@ RSpec.describe CanvasGanttsController, type: :controller do
     it 'is false when setting is explicitly OFF' do
       allow(controller).to receive(:plugin_settings).and_return({ 'inline_edit_custom_fields' => '0' })
       expect(controller.send(:inline_custom_fields_enabled?)).to be(false)
-    end
-  end
-
-  describe '#ensure_project_move_valid!' do
-    let(:destination_project) { instance_double(Project, id: 3) }
-    let(:tracker) { instance_double(Tracker, id: 7) }
-    let(:assignable_user) { instance_double(User, id: 11) }
-    let(:issue_errors) { instance_double(ActiveModel::Errors, add: nil, full_messages: ['invalid']) }
-    let(:issue) do
-      instance_double(
-        Issue,
-        project: destination_project,
-        tracker: tracker,
-        assigned_to_id: nil,
-        assignable_users: [],
-        fixed_version: nil,
-        category: nil,
-        errors: issue_errors
-      )
-    end
-
-    before do
-      allow(controller).to receive(:permitted_task_params).and_return(ActionController::Parameters.new(project_id: '3'))
-      allow(destination_project).to receive(:trackers).and_return([tracker])
-      allow(destination_project).to receive(:assignable_users).and_return([assignable_user])
-      allow(User.current).to receive(:allowed_to?).with(:add_issues, destination_project).and_return(true)
-    end
-
-    let(:original_values) do
-      {
-        project_id: 1,
-        tracker_id: 7,
-        assigned_to_id: nil,
-        fixed_version_id: nil,
-        category_id: nil
-      }
-    end
-
-    it 'allows move to a project in scope_project_ids even if not in visible_project_ids' do
-      allow(controller).to receive(:current_view_scope).and_return(
-        scope_project_ids: [3, 5],
-        visible_project_ids: [5]
-      )
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(true)
-    end
-
-    it 'forbids move to a project outside scope_project_ids' do
-      allow(controller).to receive(:current_view_scope).and_return(
-        scope_project_ids: [5],
-        visible_project_ids: [5]
-      )
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(false)
-      expect(response).to have_http_status(:forbidden)
-    end
-
-    it 'rejects a move when the original tracker is not available in the destination project' do
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-      allow(destination_project).to receive(:trackers).and_return([])
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(false)
-      expect(response).to have_http_status(:unprocessable_entity)
-      expect(issue_errors).to have_received(:add).with(:tracker, :invalid)
-    end
-
-    it 'rejects Redmine tracker fallback when original tracker is unavailable even if current issue tracker was normalized' do
-      fallback_tracker = instance_double(Tracker, id: 99)
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-      allow(destination_project).to receive(:trackers).and_return([fallback_tracker])
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(false)
-      expect(response).to have_http_status(:unprocessable_entity)
-      expect(issue_errors).to have_received(:add).with(:tracker, :invalid)
-    end
-
-    it 'rejects a requested tracker that is not available in the destination project' do
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-      allow(controller).to receive(:permitted_task_params).and_return(ActionController::Parameters.new(project_id: '3', tracker_id: '99'))
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(false)
-      expect(response).to have_http_status(:unprocessable_entity)
-      expect(issue_errors).to have_received(:add).with(:tracker, :invalid)
-    end
-
-    it 'rejects a move when the original assignee is not assignable in the destination project' do
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-      allow(destination_project).to receive(:assignable_users).and_return([])
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values.merge(assigned_to_id: 11))).to be(false)
-      expect(response).to have_http_status(:unprocessable_entity)
-      expect(issue_errors).to have_received(:add).with(:assigned_to, :invalid)
-    end
-
-    it 'rejects a requested assignee that is not assignable in the destination project' do
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-      allow(controller).to receive(:permitted_task_params).and_return(ActionController::Parameters.new(project_id: '3', assigned_to_id: '99'))
-
-      expect(controller.send(:ensure_project_move_valid!, issue, original_values)).to be(false)
-      expect(response).to have_http_status(:unprocessable_entity)
-      expect(issue_errors).to have_received(:add).with(:assigned_to, :invalid)
-    end
-
-    it 'clears fixed version and category that do not belong to the destination project' do
-      fixed_version = instance_double(Version, project_id: 1)
-      category = instance_double(IssueCategory, project_id: 1)
-      movable_issue = instance_double(
-        Issue,
-        project: destination_project,
-        fixed_version: fixed_version,
-        category: category,
-        errors: issue_errors
-      )
-      allow(movable_issue).to receive(:fixed_version=)
-      allow(movable_issue).to receive(:category=)
-      allow(controller).to receive(:current_view_scope).and_return(scope_project_ids: [3], visible_project_ids: [3])
-
-      expect(controller.send(:ensure_project_move_valid!, movable_issue, original_values)).to be(true)
-      expect(movable_issue).to have_received(:fixed_version=).with(nil)
-      expect(movable_issue).to have_received(:category=).with(nil)
     end
   end
 
@@ -1374,5 +2083,82 @@ RSpec.describe CanvasGanttsController, type: :controller do
       values = controller.send(:custom_field_extractor).build_task_custom_field_values(issue)
       expect(values).to eq('1' => 'A-001')
     end
+  end
+
+  describe 'POST #schedule_mutation' do
+    before do
+      allow(controller).to receive(:set_permissions) do
+        controller.instance_variable_set(:@permissions, { editable: true, viewable: true })
+      end
+      allow(controller).to receive(:schedule_mutation_coordinator).and_return(
+        instance_double(
+          RedmineCanvasGantt::ScheduleMutationCoordinator,
+          call: RedmineCanvasGantt::ScheduleMutationCoordinator::Result.new(
+            status: :ok,
+            entities: [],
+            revisions: {},
+            invalidated_entity_ids: [],
+            errors: []
+          )
+        )
+      )
+    end
+
+    it 'exposes a single operation boundary for a multi-issue schedule change' do
+      post :schedule_mutation,
+           params: {
+             project_id: 'demo',
+             operation_id: 'schedule:test-a-b',
+             base_revisions: { '10' => 1, '11' => 1 },
+             changes: [
+               { task_id: 10, start_date: '2027-01-04', due_date: '2027-01-05' },
+               { task_id: 11, start_date: '2027-01-06', due_date: '2027-01-07' }
+             ]
+           },
+           format: :json
+
+      expect(response).to have_http_status(:ok)
+      expect(JSON.parse(response.body)).to include(
+        'status' => 'ok',
+        'operation_id' => 'schedule:test-a-b',
+        'completeness' => 'complete'
+      )
+    end
+
+    it 'rejects a calendar-sensitive mutation when the client revision is stale' do
+      calendar_resolver = instance_double(
+        RedmineCanvasGantt::ProjectCalendarResolver,
+        revision: 'calendar-revision-2'
+      )
+      allow(controller).to receive(:business_calendar_resolver).and_return(calendar_resolver)
+      expect(controller).not_to receive(:schedule_mutation_coordinator)
+      request.headers['X-Redmine-Canvas-Gantt-Calendar-Revision'] = 'calendar-revision-1'
+
+      post :schedule_mutation,
+           params: {
+             project_id: 'demo',
+             operation_id: 'schedule:stale-calendar',
+             base_revisions: { '10' => 1 },
+             changes: [{ task_id: 10, due_date: '2027-01-05' }]
+           },
+           format: :json
+
+      expect(response).to have_http_status(:conflict)
+      expect(JSON.parse(response.body)).to include(
+        'status' => 'conflict',
+        'failure' => include(
+          'kind' => 'conflict',
+          'resource_role' => 'scope',
+          'resource_type' => 'business_calendar',
+          'resource_id' => 'calendar-revision-2',
+          'remote_availability' => 'needs_refresh'
+        ),
+        'conflict' => {
+          'expected_calendar_revision' => 'calendar-revision-1',
+          'actual_calendar_revision' => 'calendar-revision-2'
+        }
+      )
+    end
+
   end
 end

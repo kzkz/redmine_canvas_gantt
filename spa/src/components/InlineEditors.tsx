@@ -123,6 +123,7 @@ export const SelectEditor: React.FC<{
     controlHeight?: number;
 }> = ({ value, options, includeUnassigned, emptyOptionLabel, onCommit, onCancel, controlHeight }) => {
     const [saving, setSaving] = React.useState(false);
+    const savingRef = React.useRef(false);
     const [error, setError] = React.useState<string | null>(null);
     const [filter, setFilter] = React.useState('');
 
@@ -134,16 +135,20 @@ export const SelectEditor: React.FC<{
     }, [filter, options]);
 
     const commit = async (next: number | null) => {
+        if (savingRef.current) return;
         if (next === value) {
             onCancel();
             return;
         }
+        savingRef.current = true;
         setSaving(true);
         setError(null);
         try {
             await onCommit(next);
         } catch (e) {
             setError(e instanceof Error ? e.message : (i18n.t('label_failed_to_save') || 'Failed to save'));
+        } finally {
+            savingRef.current = false;
             setSaving(false);
         }
     };
@@ -174,6 +179,7 @@ export const SelectEditor: React.FC<{
                     void commit(next);
                 }}
                 onBlur={(e) => {
+                    if (savingRef.current) return;
                     const container = e.currentTarget.parentElement;
                     if (container && !container.contains(e.relatedTarget as Node)) {
                         onCancel();
@@ -376,7 +382,9 @@ export const DueDateEditor: React.FC<{
 
     const parseValue = (val: string) => {
         if (!val) return null;
-        const d = new Date(val);
+        const [year, month, day] = val.split('-').map(Number);
+        if (![year, month, day].every(Number.isInteger)) return null;
+        const d = new Date(year, month - 1, day);
         return isNaN(d.getTime()) ? null : d;
     };
 

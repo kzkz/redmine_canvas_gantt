@@ -1,11 +1,14 @@
-import type { LayoutRow, MoveTaskAsChildResult, Task } from '../../types';
-import { buildMoveTaskResult, createTaskLayoutSnapshot } from './taskPersistence';
+import type { LayoutRow, MoveTaskAsChildResult, PersistedTaskState, Task } from '../../types';
+import { buildMoveTaskResult, createTaskLayoutSnapshot, type MutationLifecycle } from './taskPersistence';
 import { i18n } from '../../utils/i18n';
 import type { LayoutState } from './types';
 import type { TaskLayoutSnapshot } from './types';
+import type { MutationMetadata, MutationStatus } from '../../api/client';
+import type { LocalPatch, ServerSnapshot } from './stateContract';
+import { classifyMutationError, classifyMutationResult, classifyMutationSourceDisposition } from '../../api/mutationOutcome';
 
-type UpdateTaskFieldsResult = {
-    status: 'ok' | 'conflict' | 'error';
+type UpdateTaskFieldsResult = MutationMetadata & {
+    status: MutationStatus;
     error?: string;
     lockVersion?: number;
     parentId?: string;
@@ -16,10 +19,13 @@ type ParentMoveState = LayoutState & {
     layoutRows: LayoutRow[];
     rowCount: number;
     modifiedTaskIds: Set<string>;
+    editGenerations: Record<string, number>;
     autoSave: boolean;
+    localTaskPatches: Record<string, Array<LocalPatch<Task>>>;
+    serverTaskSnapshot: ServerSnapshot<Task>;
 };
 
-type ParentMovePatch = Partial<Pick<ParentMoveState, 'allTasks' | 'tasks' | 'layoutRows' | 'rowCount' | 'modifiedTaskIds'>>;
+type ParentMovePatch = Partial<Pick<ParentMoveState, 'allTasks' | 'tasks' | 'layoutRows' | 'rowCount' | 'modifiedTaskIds' | 'editGenerations' | 'localTaskPatches' | 'serverTaskSnapshot'>>;
 
 type ParentMoveCallbacks = {
     sourceTaskId: string;
@@ -27,14 +33,23 @@ type ParentMoveCallbacks = {
     getState: () => ParentMoveState;
     setState: (patch: ParentMovePatch) => void;
     restoreSnapshot: (snapshot: TaskLayoutSnapshot) => void;
+    rollbackOperation?: (operationGeneration: number, sourceBefore: Task) => void;
     buildNextOrder: (allTasks: Task[], sourceBefore: Task) => number;
     buildNextAllTasks: (allTasks: Task[], sourceTaskId: string, nextOrder: number) => Task[];
     buildOptimisticPatch: (state: ParentMoveState, nextAllTasks: Task[]) => ParentMovePatch;
-    buildSuccessPatch: (state: ParentMoveState, sourceBefore: Task, result: UpdateTaskFieldsResult) => ParentMovePatch;
-    updateTaskFields: (taskId: string, payload: { parent_issue_id: string | null; lock_version: number }) => Promise<UpdateTaskFieldsResult>;
+    buildSuccessPatch: (state: ParentMoveState, sourceBefore: Task, result: UpdateTaskFieldsResult, operationGeneration: number) => ParentMovePatch;
+    ownsOperation: (state: ParentMoveState, sourceBefore: Task, operationGeneration: number) => boolean;
+    updateTaskFields: (
+        taskId: string,
+        payload: () => { parent_issue_id: string | null; lock_version: number },
+        lifecycle?: MutationLifecycle<UpdateTaskFieldsResult>
+    ) => Promise<UpdateTaskFieldsResult>;
     validatePersistedResult: (result: UpdateTaskFieldsResult, expectedParentId: string | undefined) => boolean;
     missingSourceResult: MoveTaskAsChildResult;
     failedResult: (error?: string) => MoveTaskAsChildResult;
+    onConflict?: (taskId: string, message: string, operationGeneration: number, remoteEntity?: PersistedTaskState, remoteRevision?: number) => void;
+    onNotFound?: (taskId: string, operationGeneration: number, operationId?: string) => void;
+    onMutationMetadata?: (taskId: string, metadata: MutationMetadata) => void;
 };
 
 export const runParentMove = async (callbacks: ParentMoveCallbacks): Promise<MoveTaskAsChildResult> => {
@@ -44,14 +59,19 @@ export const runParentMove = async (callbacks: ParentMoveCallbacks): Promise<Mov
         getState,
         setState,
         restoreSnapshot,
+        rollbackOperation,
         buildNextOrder,
         buildNextAllTasks,
         buildOptimisticPatch,
         buildSuccessPatch,
+        ownsOperation,
         updateTaskFields,
         validatePersistedResult,
         missingSourceResult,
-        failedResult
+        failedResult,
+        onConflict,
+        onNotFound,
+        onMutationMetadata
     } = callbacks;
 
     const beforeState = getState();
@@ -64,13 +84,11 @@ export const runParentMove = async (callbacks: ParentMoveCallbacks): Promise<Mov
 
     const nextOrder = buildNextOrder(beforeState.allTasks, sourceBefore);
     const nextAllTasks = buildNextAllTasks(beforeState.allTasks, sourceTaskId, nextOrder);
+    const operationGeneration = (beforeState.editGenerations[sourceTaskId] ?? 0) + 1;
 
     setState(buildOptimisticPatch(beforeState, nextAllTasks));
 
     if (!beforeState.autoSave) {
-        const nextModified = new Set(beforeState.modifiedTaskIds);
-        nextModified.add(sourceTaskId);
-        setState({ modifiedTaskIds: nextModified });
         return buildMoveTaskResult('ok', {
             lockVersion: sourceBefore.lockVersion,
             parentId: expectedParentId
@@ -78,25 +96,81 @@ export const runParentMove = async (callbacks: ParentMoveCallbacks): Promise<Mov
     }
 
     let result: UpdateTaskFieldsResult;
+    const lifecycle: MutationLifecycle<UpdateTaskFieldsResult> = {
+        onResult: (completedResult, context) => {
+            if (completedResult.status === 'ok' && validatePersistedResult(completedResult, expectedParentId)) {
+                setState(buildSuccessPatch(getState(), sourceBefore, completedResult, operationGeneration));
+                onMutationMetadata?.(sourceTaskId, completedResult);
+                return;
+            }
+
+            if (completedResult.status === 'conflict') {
+                onConflict?.(
+                    sourceTaskId,
+                    completedResult.error || (i18n.t('label_parent_drop_conflict') || 'Task was updated by another user'),
+                    operationGeneration,
+                    completedResult.entity,
+                    completedResult.revision ?? completedResult.entity?.lockVersion
+                );
+                return;
+            }
+            const sourceDisposition = classifyMutationSourceDisposition(completedResult);
+            if (sourceDisposition !== 'not_applicable') {
+                if (sourceDisposition === 'target_missing') {
+                    onNotFound?.(sourceTaskId, operationGeneration, context.operationId);
+                } else {
+                    if (ownsOperation(getState(), sourceBefore, operationGeneration)) {
+                        rollbackOperation?.(operationGeneration, sourceBefore);
+                        if (!rollbackOperation) restoreSnapshot(snapshot);
+                    }
+                }
+                return;
+            }
+            if (classifyMutationResult(completedResult).kind === 'transient') return;
+            if (ownsOperation(getState(), sourceBefore, operationGeneration)) {
+                rollbackOperation?.(operationGeneration, sourceBefore);
+                if (!rollbackOperation) restoreSnapshot(snapshot);
+            }
+        },
+        onError: (error, context) => {
+            const errorOutcome = classifyMutationError(error);
+            const sourceDisposition = classifyMutationSourceDisposition(error);
+            if (sourceDisposition !== 'not_applicable') {
+                if (sourceDisposition === 'target_missing') {
+                    onNotFound?.(sourceTaskId, operationGeneration, context.operationId);
+                } else {
+                    if (ownsOperation(getState(), sourceBefore, operationGeneration)) {
+                        rollbackOperation?.(operationGeneration, sourceBefore);
+                        if (!rollbackOperation) restoreSnapshot(snapshot);
+                    }
+                }
+                return;
+            }
+            if (errorOutcome.kind === 'transient') return;
+            if (ownsOperation(getState(), sourceBefore, operationGeneration)) {
+                rollbackOperation?.(operationGeneration, sourceBefore);
+                if (!rollbackOperation) restoreSnapshot(snapshot);
+            }
+        }
+    };
     try {
-        result = await updateTaskFields(sourceTaskId, {
-            parent_issue_id: expectedParentId ?? null,
-            lock_version: sourceBefore.lockVersion
-        });
+        result = await updateTaskFields(
+            sourceTaskId,
+            () => ({
+                parent_issue_id: expectedParentId ?? null,
+                lock_version: getState().allTasks.find(task => task.id === sourceTaskId)?.lockVersion ?? sourceBefore.lockVersion
+            }),
+            lifecycle
+        );
     } catch (error) {
-        restoreSnapshot(snapshot);
         return failedResult(error instanceof Error ? error.message : undefined);
     }
 
     if (result.status !== 'ok' || !validatePersistedResult(result, expectedParentId)) {
-        restoreSnapshot(snapshot);
-        return buildMoveTaskResult(result.status === 'ok' ? 'error' : result.status, {
+        return buildMoveTaskResult(result.status === 'conflict' ? 'conflict' : 'error', {
             error: result.error || (failedResult().error ?? (i18n.t('label_failed_to_update_parent') || 'Failed to update parent'))
         });
     }
-
-    const currentState = getState();
-    setState(buildSuccessPatch(currentState, sourceBefore, result));
 
     return buildMoveTaskResult('ok', {
         lockVersion: result.lockVersion,

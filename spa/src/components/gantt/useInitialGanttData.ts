@@ -6,6 +6,7 @@ import type { Viewport } from '../../types';
 import { replaceIssueQueryParamsInUrl, resolveInitialSharedQueryState } from '../../utils/queryParams';
 import { loadLastUsedSharedQueryProjectState } from '../../utils/sharedQueryState';
 import { resolvedQueryStateFromProjectState } from '../../query/queryStateCodec';
+import { fromLocalDate, toCalendarDate, toTimelineDate, todayCalendarDate } from '../../utils/dateOnly';
 
 type Params = {
     viewportFromStorage: boolean;
@@ -22,7 +23,7 @@ export const useInitialGanttData = ({
         if (hasFetched.current) return;
         hasFetched.current = true;
 
-        import('../../api/client').then(({ apiClient }) => {
+        const loadInitialData = async () => {
             const storedProjectState = loadLastUsedSharedQueryProjectState();
             const initialSharedQueryState = resolveInitialSharedQueryState(
                 window.location.search,
@@ -64,28 +65,37 @@ export const useInitialGanttData = ({
                 })()
                 : initialRawSearch;
 
-            apiClient.fetchData({
+            const hasExplicitInitialState = initialSharedQueryState.source !== 'default';
+            const initialState = hasExplicitInitialState
+                ? initialSharedQueryState.state
+                : undefined;
+
+            await useTaskStore.getState().loadInitialData({
                 rawSearch: apiRawSearch,
                 query: initialApiQuery,
-                queryContext: initialQueryContext
-            }).then(data => {
-                useTaskStore.getState().applyApiData(data);
-                void useTaskStore.getState().loadSavedQueries();
+                queryContext: initialQueryContext,
+                initialState
+            });
+            void useTaskStore.getState().loadSavedQueries();
 
-                if (!viewportFromStorage) {
-                    const minStart = getMinFiniteStartDate(data.tasks);
-                    const oneYearAgo = new Date();
-                    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
-                    oneYearAgo.setHours(0, 0, 0, 0);
+            if (!viewportFromStorage) {
+                const minStart = getMinFiniteStartDate(useTaskStore.getState().allTasks);
+                const oneYearAgo = new Date();
+                oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+                const oneYearAgoTimelineDate = toTimelineDate(fromLocalDate(oneYearAgo));
 
-                    const startDate = Math.min(minStart ?? oneYearAgo.getTime(), oneYearAgo.getTime());
-                    const currentViewport = useTaskStore.getState().viewport;
-                    const now = new Date().setHours(0, 0, 0, 0);
-                    const scrollX = Math.max(0, (now - startDate) * currentViewport.scale - 100);
+                const startDate = Math.min(
+                    minStart === null ? oneYearAgoTimelineDate : toTimelineDate(toCalendarDate(minStart)),
+                    oneYearAgoTimelineDate
+                );
+                const currentViewport = useTaskStore.getState().viewport;
+                const now = toTimelineDate(todayCalendarDate());
+                const scrollX = Math.max(0, (now - startDate) * currentViewport.scale - 100);
 
-                    updateViewport({ startDate, scrollX });
-                }
-            }).catch(err => console.error('Failed to load Gantt data', err));
-        });
+                updateViewport({ startDate, scrollX });
+            }
+        };
+
+        void loadInitialData().catch(err => console.error('Failed to load Gantt data', err));
     }, [updateViewport, viewportFromStorage]);
 };

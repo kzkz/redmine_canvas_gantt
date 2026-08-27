@@ -2,11 +2,11 @@ import React from 'react';
 import { useTaskStore } from '../stores/TaskStore';
 import { i18n } from '../utils/i18n';
 import { LayoutEngine } from '../engines/LayoutEngine';
-import { apiClient } from '../api/client';
+import { taskMutationService } from '../services/taskMutationService';
 import { RelationType } from '../types/constraints';
 import { useUIStore } from '../stores/UIStore';
 import { useBaselineStore } from '../stores/BaselineStore';
-import type { DraftRelation, Task } from '../types';
+import type { DraftRelation, Relation, Task } from '../types';
 import { buildRedmineUrl } from '../utils/redmineUrl';
 import { calculateBaselineDiff, formatBaselineCapturedAt, getBaselineTaskState } from '../utils/baseline';
 import {
@@ -52,6 +52,11 @@ const RESIZE_HANDLE_SELECTED_BORDER = rgbaFromPrimary(0.82);
 const RESIZE_HANDLE_GRIP = designTokens.controlActiveFg;
 const RESIZE_HANDLE_SHADOW = `0 1px 3px ${rgbaFromPrimary(0.18)}`;
 const BASELINE_POPOVER_OFFSET = 12;
+
+const toRelationState = (relation: Relation): Relation => {
+    const { id, from, to, type, delay } = relation;
+    return delay === undefined ? { id, from, to, type } : { id, from, to, type, delay };
+};
 
 
 export const HtmlOverlay: React.FC = () => {
@@ -242,22 +247,29 @@ export const HtmlOverlay: React.FC = () => {
     }, [hitTestTask, setDragDraftState, toLocalPoint]);
 
     const handleCreateRelation = React.useCallback(async (relation: DraftRelation, rawType: string, delay?: number) => {
-        const createdRelation = await apiClient.createRelation(relation.from, relation.to, rawType, delay);
-        addRelation(createdRelation);
+        const createdRelation = await taskMutationService.createRelation(relation.from, relation.to, rawType, delay);
+        addRelation(toRelationState(createdRelation));
+        useTaskStore.getState().refreshForMutationMetadata(createdRelation);
         clearRelationSelection();
         useUIStore.getState().addNotification(i18n.t('label_relation_added') || 'Dependency created', 'success');
     }, [addRelation, clearRelationSelection]);
 
     const handleUpdateRelation = React.useCallback(async (relationId: string, rawType: string, delay?: number) => {
-        const updatedRelation = await apiClient.updateRelation(relationId, rawType, delay);
-        replaceRelation(updatedRelation);
+        const currentRelation = useTaskStore.getState().relations.find(relation => relation.id === relationId);
+        const endpointIds = currentRelation ? [currentRelation.from, currentRelation.to] : [];
+        const updatedRelation = await taskMutationService.updateRelation(relationId, rawType, delay, endpointIds);
+        replaceRelation(toRelationState(updatedRelation));
+        useTaskStore.getState().refreshForMutationMetadata(updatedRelation);
         clearRelationSelection();
         useUIStore.getState().addNotification(i18n.t('label_relation_updated') || 'Dependency updated', 'success');
     }, [clearRelationSelection, replaceRelation]);
 
     const handleRemoveRelation = React.useCallback(async (relationId: string) => {
-        await apiClient.deleteRelation(relationId);
+        const currentRelation = useTaskStore.getState().relations.find(relation => relation.id === relationId);
+        const endpointIds = currentRelation ? [currentRelation.from, currentRelation.to] : [];
+        const metadata = await taskMutationService.deleteRelation(relationId, endpointIds);
         removeRelation(relationId);
+        if (metadata) useTaskStore.getState().refreshForMutationMetadata(metadata);
         clearRelationSelection();
         setContextMenu(null);
         useUIStore.getState().addNotification(i18n.t('label_relation_removed') || 'Dependency removed', 'success');
@@ -484,8 +496,12 @@ export const HtmlOverlay: React.FC = () => {
         if (!window.confirm(message)) return;
 
         try {
-            await apiClient.deleteTask(taskId);
-            useTaskStore.getState().removeTask(taskId);
+            const metadata = await taskMutationService.deleteTask(taskId);
+            if (metadata) {
+                useTaskStore.getState().applyTaskMutationMetadata(taskId, metadata);
+            } else {
+                useTaskStore.getState().removeTask(taskId);
+            }
             useUIStore.getState().addNotification((i18n.t('button_delete') || 'Delete') + ': ' + (i18n.t('label_success') || 'Success'), 'success');
         } catch (error: unknown) {
             const messageText = error instanceof Error ? error.message : undefined;

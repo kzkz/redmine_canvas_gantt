@@ -39,6 +39,7 @@ test('edits status inline', async ({ page }) => {
   const patchPayloads: unknown[] = [];
   await setupMockApp(page, {
     preferences: {
+      autoSave: true,
       visibleColumns: ['id', 'subject', 'status'],
       sidebarWidth: 700,
     },
@@ -56,10 +57,50 @@ test('edits status inline', async ({ page }) => {
   expect(payload.task?.status_id).toBe(3);
 });
 
+test('normalizes Tracker Status through Preview and keeps follow-up Status editing available', async ({ page }) => {
+  await setupMockApp(page, {
+    editTrackers: [
+      { id: 1, name: 'Task' },
+      { id: 2, name: 'Bug' },
+    ],
+    editStatusByTracker: {
+      '2': { id: 2, name: 'In Progress' },
+    },
+    preferences: {
+      autoSave: false,
+      visibleColumns: ['id', 'subject', 'status', 'tracker'],
+      sidebarWidth: 800,
+    },
+  });
+  await waitForInitialRender(page);
+
+  await dispatchCellDoubleClick(page.getByTestId('cell-101-tracker'));
+  const trackerSelect = page.locator('[data-testid="task-row-101"] select').first();
+  await expect(trackerSelect).toBeVisible();
+  await trackerSelect.selectOption({ label: 'Bug' });
+
+  await expect(page.getByTestId('task-status-badge-101')).toHaveText('In Progress');
+  const previewState = await page.evaluate(async () => {
+    const { useTaskStore } = await import('/src/stores/TaskStore.ts');
+    const task = useTaskStore.getState().allTasks.find(candidate => candidate.id === '101');
+    return task ? {
+      trackerId: task.trackerId,
+      statusId: task.statusId,
+      modified: useTaskStore.getState().modifiedTaskIds.has('101'),
+      intent: useTaskStore.getState().localTaskPatches['101']?.[0]?.mutationIntent,
+    } : null;
+  });
+  expect(previewState).toEqual({ trackerId: 2, statusId: 2, modified: true, intent: { trackerId: 2 } });
+
+  await dispatchCellDoubleClick(page.getByTestId('cell-101-status'));
+  await expect(page.locator('[data-testid="task-row-101"] select').first()).toBeVisible();
+});
+
 test('saves inline number editor on blur', async ({ page }) => {
   const patchPayloads: unknown[] = [];
   await setupMockApp(page, {
     preferences: {
+      autoSave: true,
       visibleColumns: ['id', 'subject', 'ratioDone'],
       sidebarWidth: 700,
     },
@@ -112,6 +153,7 @@ test('edits a non-descendant member project task inline', async ({ page }) => {
       initial_state: { memberProjectsOnly: true },
     },
     preferences: {
+      autoSave: true,
       visibleColumns: ['id', 'subject', 'status', 'ratioDone'],
       sidebarWidth: 700,
     },
@@ -162,4 +204,40 @@ test('does not expose inline edit controls for tasks outside the current view', 
 
   await expect(page.getByText('I-P2-HIDDEN')).toHaveCount(0);
   await expect(page.getByTestId('cell-302-status')).toHaveCount(0);
+});
+
+test('rolls a bar resize back after a terminal API rejection', async ({ page }) => {
+  await setupMockApp(page, { failTaskPatch: true });
+  await waitForInitialRender(page);
+
+  await page.getByTestId('task-row-201').dispatchEvent('click');
+  const handle = page.getByTestId('task-resize-handle-end-201');
+  await expect(handle).toBeVisible();
+
+  const original = await page.evaluate(async () => {
+    const { useTaskStore } = await import('/src/stores/TaskStore.ts');
+    useTaskStore.getState().setAutoSave(true);
+    const task = useTaskStore.getState().allTasks.find((candidate) => candidate.id === '201');
+    return task ? { startDate: task.startDate, dueDate: task.dueDate } : null;
+  });
+  expect(original).not.toBeNull();
+
+  const box = await handle.boundingBox();
+  expect(box).not.toBeNull();
+  const x = box!.x + box!.width / 2;
+  const y = box!.y + box!.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x + 40, y);
+  await page.mouse.up();
+
+  await expect.poll(async () => page.evaluate(async () => {
+    const { useTaskStore } = await import('/src/stores/TaskStore.ts');
+    const task = useTaskStore.getState().allTasks.find((candidate) => candidate.id === '201');
+    return task ? {
+      startDate: task.startDate,
+      dueDate: task.dueDate,
+      dirty: useTaskStore.getState().modifiedTaskIds.has('201')
+    } : null;
+  })).toEqual({ ...original, dirty: false });
 });

@@ -125,7 +125,7 @@ describe('HtmlOverlay', () => {
 
     it('opens a draft relation popover after dragging a dependency handle when auto apply is off', async () => {
         const relation: Relation = { id: 'rel-1', from: '1', to: '2', type: RelationType.Precedes, delay: 0 };
-        vi.mocked(apiClient.createRelation).mockResolvedValue(relation);
+        vi.mocked(apiClient.createRelation).mockResolvedValue({ status: 'ok', ...relation });
 
         act(() => {
             useUIStore.setState({ autoApplyDefaultRelation: false });
@@ -150,7 +150,7 @@ describe('HtmlOverlay', () => {
         fireEvent.click(screen.getByTestId('relation-save-button'));
 
         await waitFor(() => {
-            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0);
+            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0, expect.stringMatching(/^mutation:/));
             expect(useTaskStore.getState().relations).toEqual([relation]);
             expect(useTaskStore.getState().draftRelation).toBeNull();
         });
@@ -159,7 +159,7 @@ describe('HtmlOverlay', () => {
 
     it('creates reversed endpoints when dragging from the left dependency handle', async () => {
         const relation: Relation = { id: 'rel-1', from: '2', to: '1', type: RelationType.Relates };
-        vi.mocked(apiClient.createRelation).mockResolvedValue(relation);
+        vi.mocked(apiClient.createRelation).mockResolvedValue({ status: 'ok', ...relation });
 
         act(() => {
             useUIStore.setState({ autoApplyDefaultRelation: false });
@@ -183,7 +183,7 @@ describe('HtmlOverlay', () => {
         fireEvent.click(screen.getByTestId('relation-save-button'));
 
         await waitFor(() => {
-            expect(apiClient.createRelation).toHaveBeenCalledWith('2', '1', RelationType.Relates, undefined);
+            expect(apiClient.createRelation).toHaveBeenCalledWith('2', '1', RelationType.Relates, undefined, expect.stringMatching(/^mutation:/));
             expect(useTaskStore.getState().relations).toEqual([relation]);
         });
     });
@@ -337,7 +337,7 @@ describe('HtmlOverlay', () => {
 
     it('creates relation immediately after dragging when auto apply is on', async () => {
         const relation: Relation = { id: 'rel-1', from: '1', to: '2', type: RelationType.Precedes, delay: 2 };
-        vi.mocked(apiClient.createRelation).mockResolvedValue(relation);
+        vi.mocked(apiClient.createRelation).mockResolvedValue({ status: 'ok', ...relation });
 
         act(() => {
             useUIStore.setState({
@@ -361,7 +361,7 @@ describe('HtmlOverlay', () => {
         fireEvent.mouseUp(window);
 
         await waitFor(() => {
-            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0);
+            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0, expect.stringMatching(/^mutation:/));
             expect(useTaskStore.getState().relations).toEqual([relation]);
         });
         expect(screen.queryByTestId('relation-editor')).not.toBeInTheDocument();
@@ -369,7 +369,7 @@ describe('HtmlOverlay', () => {
     it('updates an existing relation from the popover', async () => {
         const existingRelation: Relation = { id: 'rel-1', from: '1', to: '2', type: RelationType.Follows, delay: 2 };
         const updatedRelation: Relation = { id: 'rel-1', from: '1', to: '2', type: RelationType.Blocked };
-        vi.mocked(apiClient.updateRelation).mockResolvedValue(updatedRelation);
+        vi.mocked(apiClient.updateRelation).mockResolvedValue({ status: 'ok', ...updatedRelation });
 
         act(() => {
             useTaskStore.getState().setTasks([task1, task2]);
@@ -384,7 +384,7 @@ describe('HtmlOverlay', () => {
         fireEvent.click(screen.getByTestId('relation-save-button'));
 
         await waitFor(() => {
-            expect(apiClient.updateRelation).toHaveBeenCalledWith('rel-1', RelationType.Blocked, undefined);
+            expect(apiClient.updateRelation).toHaveBeenCalledWith('rel-1', RelationType.Blocked, undefined, expect.stringMatching(/^mutation:/));
             expect(useTaskStore.getState().relations).toEqual([updatedRelation]);
             expect(useTaskStore.getState().selectedRelationId).toBeNull();
         });
@@ -447,7 +447,7 @@ describe('HtmlOverlay', () => {
 
     it('allows save when dependency dates are missing', async () => {
         const relation: Relation = { id: 'rel-1', from: '1', to: '2', type: RelationType.Precedes, delay: 0 };
-        vi.mocked(apiClient.createRelation).mockResolvedValue(relation);
+        vi.mocked(apiClient.createRelation).mockResolvedValue({ status: 'ok', ...relation });
 
         act(() => {
             useTaskStore.getState().setTasks([
@@ -467,7 +467,7 @@ describe('HtmlOverlay', () => {
         fireEvent.click(await screen.findByTestId('relation-save-button'));
 
         await waitFor(() => {
-            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0);
+            expect(apiClient.createRelation).toHaveBeenCalledWith('1', '2', RelationType.Precedes, 0, expect.stringMatching(/^mutation:/));
         });
     });
 
@@ -497,7 +497,7 @@ describe('HtmlOverlay', () => {
     });
 
     it('deletes a relation from the popover after confirmation', async () => {
-        vi.mocked(apiClient.deleteRelation).mockResolvedValue(undefined);
+        vi.mocked(apiClient.deleteRelation).mockResolvedValue({ status: 'ok' });
 
         act(() => {
             useTaskStore.getState().setTasks([task1, task2]);
@@ -509,7 +509,7 @@ describe('HtmlOverlay', () => {
         fireEvent.click(await screen.findByTestId('relation-delete-button'));
 
         await waitFor(() => {
-            expect(apiClient.deleteRelation).toHaveBeenCalledWith('rel-1');
+            expect(apiClient.deleteRelation).toHaveBeenCalledWith('rel-1', expect.stringMatching(/^mutation:/));
             expect(useTaskStore.getState().relations).toEqual([]);
             expect(useTaskStore.getState().selectedRelationId).toBeNull();
         });

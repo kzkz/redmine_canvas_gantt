@@ -6,10 +6,13 @@ import { LayoutEngine } from './LayoutEngine';
 import type { Relation, Task } from '../types';
 import { RelationType } from '../types/constraints';
 import { buildRelationRenderContext, buildRelationRoutePoints, getPolylineMidpoint } from '../renderers/relationGeometry';
+import { diffCalendarDays, formatDateOnly, parseDateOnly } from '../utils/dateOnly';
+import { configureBusinessCalendar } from '../utils/businessCalendar';
 
 vi.mock('../api/client', () => ({
     apiClient: {
         updateTask: vi.fn(),
+        scheduleMutation: vi.fn(),
         fetchData: vi.fn()
     }
 }));
@@ -89,6 +92,7 @@ const seedTasks = (tasks: Task[], overrides: Partial<ReturnType<typeof useTaskSt
 
 beforeEach(() => {
     vi.mocked(apiClient.updateTask).mockReset();
+    vi.mocked(apiClient.scheduleMutation).mockReset();
     vi.mocked(apiClient.fetchData).mockReset();
     useUIStore.setState({ isSidebarResizing: false });
 });
@@ -164,13 +168,47 @@ describe('InteractionEngine viewport panning', () => {
 });
 
 describe('InteractionEngine task updates', () => {
+    it.each([
+        ['move', '2026-03-08', '2026-03-09'],
+        ['start resize', '2026-11-01', '2026-11-02'],
+        ['due resize', '2026-07-27', '2026-07-28']
+    ])('keeps calendar dates local across %s snapping', (_operation, input, expected) => {
+        const container = createContainer();
+        const engine = new InteractionEngine(container);
+        const timestamp = parseDateOnly(input);
+        expect(timestamp).not.toBeNull();
+
+        const snapped = (engine as unknown as { snapToDate(value: number): number })
+            .snapToDate(timestamp! + 24 * 60 * 60 * 1000);
+
+        expect(formatDateOnly(snapped)).toBe(expected);
+        engine.detach();
+        container.remove();
+    });
+
     it('依存関係があるタスク更新後にデータを再取得する', async () => {
-        setViewport({ startDate: 0, scrollX: 0, scrollY: 0, scale: 1 });
+        const day = 24 * 60 * 60 * 1000;
+        setViewport({
+            startDate: parseDateOnly('2025-12-01')!,
+            scrollX: 0,
+            scrollY: 0,
+            scale: 10 / day
+        });
         const container = createContainer();
         const engine = new InteractionEngine(container);
 
-        const task1 = baseTask({ id: '1', rowIndex: 0 });
-        const task2 = baseTask({ id: '2', rowIndex: 1, startDate: 20, dueDate: 30 });
+        const task1 = baseTask({
+            id: '1',
+            rowIndex: 0,
+            startDate: parseDateOnly('2026-01-01')!,
+            dueDate: parseDateOnly('2026-01-10')!
+        });
+        const task2 = baseTask({
+            id: '2',
+            rowIndex: 1,
+            startDate: parseDateOnly('2026-01-20')!,
+            dueDate: parseDateOnly('2026-01-30')!
+        });
         const relations: Relation[] = [{ id: 'r1', from: '1', to: '2', type: 'precedes' }];
 
         useTaskStore.setState({
@@ -185,12 +223,17 @@ describe('InteractionEngine task updates', () => {
             filterText: '',
             sortConfig: null,
             autoSave: true,
-            modifiedTaskIds: new Set(['1'])
+            modifiedTaskIds: new Set()
         });
 
-        vi.mocked(apiClient.updateTask).mockResolvedValue({ status: 'ok', lockVersion: 1 });
-        vi.mocked(apiClient.fetchData).mockResolvedValue({
-            tasks: [task1, task2],
+        let persistedTask: Task | undefined;
+        vi.mocked(apiClient.scheduleMutation).mockImplementation(async (changes) => {
+            const change = changes.find(candidate => candidate.taskId === task1.id);
+            if (change) persistedTask = { ...(change.task as Task), lockVersion: 1 };
+            return { status: 'ok', operationId: 'test', entities: [], revisions: { [task1.id]: 1 } };
+        });
+        vi.mocked(apiClient.fetchData).mockImplementation(async () => ({
+            tasks: [persistedTask ?? task1, task2],
             relations,
             versions: [],
             filterOptions: { projects: [], assignees: [] },
@@ -198,7 +241,7 @@ describe('InteractionEngine task updates', () => {
             statuses: [],
             project: { id: 'p1', name: 'Project' },
             permissions: { editable: true, viewable: true, baselineEditable: true }
-        });
+        }));
 
         const { viewport, zoomLevel } = useTaskStore.getState();
         const bounds = LayoutEngine.getTaskBounds(task1, viewport, 'hit', zoomLevel);
@@ -206,19 +249,154 @@ describe('InteractionEngine task updates', () => {
         window.dispatchEvent(new MouseEvent('mousemove', { clientX: bounds.x + 11, clientY: bounds.y + 1, bubbles: true }));
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
 
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-        expect(apiClient.updateTask).toHaveBeenCalled();
-        expect(apiClient.fetchData).toHaveBeenCalled();
+        await vi.waitFor(() => expect(apiClient.scheduleMutation).toHaveBeenCalled());
+        await vi.waitFor(() => expect(apiClient.fetchData).toHaveBeenCalled());
+        expect(persistedTask).toBeDefined();
+        const reloadedTask = useTaskStore.getState().allTasks.find((task) => task.id === task1.id);
+        expect(reloadedTask).toMatchObject({
+            startDate: persistedTask?.startDate,
+            dueDate: persistedTask?.dueDate,
+            lockVersion: 1
+        });
+        expect(useTaskStore.getState().modifiedTaskIds.has(task1.id)).toBe(false);
 
         engine.detach();
         container.remove();
     });
 
-    it('週表示でタスクを右に移動してもバー幅を維持する', () => {
+    it('normalizes a dragged task onto working dates and preserves business duration', () => {
+        const day = 24 * 60 * 60 * 1000;
+        configureBusinessCalendar({
+            status: 'ok',
+            revision: 'test',
+            defaultCalendarId: 'p1',
+            projectCalendarIds: { p1: 'p1' },
+            calendars: {
+                p1: {
+                    id: 'p1',
+                    name: 'P1',
+                    nonWorkingWeekDays: [0, 6],
+                    days: {}
+                }
+            },
+            warnings: []
+        });
+
+        try {
+            setViewport({
+                startDate: parseDateOnly('2027-01-01')!,
+                scrollX: 0,
+                scrollY: 0,
+                scale: 10 / day
+            });
+            const container = createContainer();
+            const engine = new InteractionEngine(container);
+            const task = baseTask({
+                id: 'working-task',
+                projectId: 'p1',
+                rowIndex: 0,
+                startDate: parseDateOnly('2027-01-01')!,
+                dueDate: parseDateOnly('2027-01-04')!
+            });
+            seedTasks([task]);
+
+            const { viewport, zoomLevel } = useTaskStore.getState();
+            const bounds = LayoutEngine.getTaskBounds(task, viewport, 'hit', zoomLevel);
+            container.dispatchEvent(new MouseEvent('mousedown', {
+                clientX: bounds.x + bounds.width / 2,
+                clientY: bounds.y + bounds.height / 2,
+                bubbles: true
+            }));
+            window.dispatchEvent(new MouseEvent('mousemove', {
+                clientX: bounds.x + bounds.width / 2 + 10,
+                clientY: bounds.y + bounds.height / 2,
+                bubbles: true
+            }));
+
+            const movedTask = useTaskStore.getState().allTasks[0];
+            expect(formatDateOnly(movedTask.startDate)).toBe('2027-01-04');
+            expect(formatDateOnly(movedTask.dueDate)).toBe('2027-01-05');
+
+            window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+            engine.detach();
+            container.remove();
+        } finally {
+            configureBusinessCalendar(undefined);
+        }
+    });
+
+    it('restores the original bar position after an auto-save validation failure', async () => {
+        const task = baseTask({ id: 'rejected-task', startDate: 0, dueDate: 10 });
+        seedTasks([task], { autoSave: true });
+        vi.mocked(apiClient.scheduleMutation).mockResolvedValue({
+            status: 'validation_error',
+            operationId: 'test',
+            entities: [],
+            revisions: {},
+            errors: ['Invalid task dates']
+        });
+        vi.mocked(apiClient.fetchData).mockResolvedValue({
+            tasks: [task],
+            relations: [],
+            versions: [],
+            filterOptions: { projects: [], assignees: [] },
+            statuses: [],
+            customFields: [],
+            project: { id: 'p1', name: 'Project' },
+            permissions: { editable: true, viewable: true, baselineEditable: true }
+        });
+
+        const container = createContainer();
+        const engine = new InteractionEngine(container);
+        const { viewport, zoomLevel } = useTaskStore.getState();
+        const bounds = LayoutEngine.getTaskBounds(task, viewport, 'hit', zoomLevel);
+        container.dispatchEvent(new MouseEvent('mousedown', {
+            clientX: bounds.x + bounds.width / 2,
+            clientY: bounds.y + bounds.height / 2,
+            bubbles: true
+        }));
+        window.dispatchEvent(new MouseEvent('mousemove', {
+            clientX: bounds.x + bounds.width / 2 + 20,
+            clientY: bounds.y + bounds.height / 2,
+            bubbles: true
+        }));
+        window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+        await vi.waitFor(() => expect(apiClient.scheduleMutation).toHaveBeenCalled());
+        expect(useTaskStore.getState().allTasks[0]).toMatchObject(task);
+        expect(useTaskStore.getState().modifiedTaskIds).not.toContain(task.id);
+
+        engine.detach();
+        container.remove();
+    });
+
+    it.each([
+        {
+            label: 'America/Los_Angeles DST start',
+            originalStart: '2026-03-07',
+            originalDue: '2026-03-09',
+            moveDays: 4,
+            expectedStart: '2026-03-11',
+            expectedDue: '2026-03-13'
+        },
+        {
+            label: 'America/Los_Angeles DST end',
+            originalStart: '2026-10-31',
+            originalDue: '2026-11-02',
+            moveDays: 4,
+            expectedStart: '2026-11-04',
+            expectedDue: '2026-11-06'
+        }
+    ])('preserves calendar duration and bar width across $label', ({
+        originalStart,
+        originalDue,
+        moveDays,
+        expectedStart,
+        expectedDue
+    }) => {
         const DAY_MS = 24 * 60 * 60 * 1000;
         setViewport({
-            startDate: Date.UTC(2026, 2, 1),
+            startDate: parseDateOnly('2026-03-01')!,
             scrollX: 0,
             scrollY: 0,
             scale: 10 / DAY_MS
@@ -230,8 +408,8 @@ describe('InteractionEngine task updates', () => {
         const task = baseTask({
             id: 'week-task',
             rowIndex: 0,
-            startDate: Date.UTC(2026, 2, 11),
-            dueDate: Date.UTC(2026, 2, 13)
+            startDate: parseDateOnly(originalStart)!,
+            dueDate: parseDateOnly(originalDue)!
         });
         seedTasks([task]);
 
@@ -246,7 +424,7 @@ describe('InteractionEngine task updates', () => {
             bubbles: true
         }));
         window.dispatchEvent(new MouseEvent('mousemove', {
-            clientX: startX + 2 * 10,
+            clientX: startX + moveDays * 10,
             clientY: startY,
             bubbles: true
         }));
@@ -254,8 +432,11 @@ describe('InteractionEngine task updates', () => {
         const movedTask = useTaskStore.getState().tasks[0];
         const afterBounds = LayoutEngine.getTaskBounds(movedTask, viewport, 'bar', zoomLevel);
 
-        expect(movedTask.startDate).toBe(Date.UTC(2026, 2, 13));
-        expect(movedTask.dueDate).toBe(Date.UTC(2026, 2, 15));
+        expect(formatDateOnly(movedTask.startDate)).toBe(expectedStart);
+        expect(formatDateOnly(movedTask.dueDate)).toBe(expectedDue);
+        expect(diffCalendarDays(movedTask.startDate!, movedTask.dueDate!)).toBe(
+            diffCalendarDays(task.startDate!, task.dueDate!)
+        );
         expect(afterBounds.width).toBe(beforeBounds.width);
 
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
@@ -424,10 +605,12 @@ describe('InteractionEngine cursor behavior', () => {
 
     it('starts resizing from the visible start handle', () => {
         const DAY_MS = 24 * 60 * 60 * 1000;
-        setViewport({ startDate: 0, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS });
+        const startDate = parseDateOnly('2026-07-01')!;
+        const dueDate = parseDateOnly('2026-07-11')!;
+        setViewport({ startDate, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS });
         const container = createContainer();
         const engine = new InteractionEngine(container);
-        const task = baseTask({ id: 'handle-start-task', rowIndex: 0, startDate: 0, dueDate: DAY_MS * 10 });
+        const task = baseTask({ id: 'handle-start-task', rowIndex: 0, startDate, dueDate });
         seedTasks([task]);
 
         const handle = document.createElement('div');
@@ -448,8 +631,8 @@ describe('InteractionEngine cursor behavior', () => {
             bubbles: true
         }));
 
-        expect(useTaskStore.getState().tasks[0].startDate).toBe(DAY_MS * 2);
-        expect(useTaskStore.getState().tasks[0].dueDate).toBe(DAY_MS * 10);
+        expect(formatDateOnly(useTaskStore.getState().tasks[0].startDate)).toBe('2026-07-03');
+        expect(useTaskStore.getState().tasks[0].dueDate).toBe(dueDate);
 
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         engine.detach();
@@ -458,10 +641,12 @@ describe('InteractionEngine cursor behavior', () => {
 
     it('starts resizing from the visible end handle', () => {
         const DAY_MS = 24 * 60 * 60 * 1000;
-        setViewport({ startDate: 0, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS });
+        const startDate = parseDateOnly('2026-07-01')!;
+        const dueDate = parseDateOnly('2026-07-11')!;
+        setViewport({ startDate, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS });
         const container = createContainer();
         const engine = new InteractionEngine(container);
-        const task = baseTask({ id: 'handle-end-task', rowIndex: 0, startDate: 0, dueDate: DAY_MS * 10 });
+        const task = baseTask({ id: 'handle-end-task', rowIndex: 0, startDate, dueDate });
         seedTasks([task]);
 
         const handle = document.createElement('div');
@@ -482,8 +667,8 @@ describe('InteractionEngine cursor behavior', () => {
             bubbles: true
         }));
 
-        expect(useTaskStore.getState().tasks[0].startDate).toBe(0);
-        expect(useTaskStore.getState().tasks[0].dueDate).toBe(DAY_MS * 12);
+        expect(useTaskStore.getState().tasks[0].startDate).toBe(startDate);
+        expect(formatDateOnly(useTaskStore.getState().tasks[0].dueDate)).toBe('2026-07-13');
 
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         engine.detach();
@@ -713,12 +898,13 @@ describe('InteractionEngine relation selection', () => {
 
     it('prefers resize over relation selection when clicking the visible end handle area', () => {
         const DAY_MS = 24 * 60 * 60 * 1000;
-        setViewport({ startDate: 0, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS, rowHeight: 36 });
+        const startDate = parseDateOnly('2026-07-01')!;
+        setViewport({ startDate, scrollX: 0, scrollY: 0, scale: 1 / DAY_MS, rowHeight: 36 });
         const container = createContainer();
         const engine = new InteractionEngine(container);
 
-        const task1 = baseTask({ id: '1', rowIndex: 0, startDate: 0, dueDate: DAY_MS });
-        const task2 = baseTask({ id: '2', rowIndex: 1, startDate: DAY_MS * 4, dueDate: DAY_MS * 5 });
+        const task1 = baseTask({ id: '1', rowIndex: 0, startDate, dueDate: parseDateOnly('2026-07-02')! });
+        const task2 = baseTask({ id: '2', rowIndex: 1, startDate: parseDateOnly('2026-07-05')!, dueDate: parseDateOnly('2026-07-06')! });
         const relation: Relation = { id: 'r1', from: '1', to: '2', type: 'precedes' };
 
         useTaskStore.setState({
@@ -755,7 +941,7 @@ describe('InteractionEngine relation selection', () => {
 
         expect(useTaskStore.getState().selectedTaskId).toBe('1');
         expect(useTaskStore.getState().selectedRelationId).toBeNull();
-        expect(useTaskStore.getState().tasks[0].dueDate).toBe(DAY_MS * 2);
+        expect(formatDateOnly(useTaskStore.getState().tasks[0].dueDate)).toBe('2026-07-03');
 
         window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
         engine.detach();

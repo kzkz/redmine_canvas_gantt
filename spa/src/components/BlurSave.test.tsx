@@ -5,6 +5,7 @@ import { useTaskStore } from '../stores/TaskStore';
 import { useUIStore } from '../stores/UIStore';
 import { useEditMetaStore } from '../stores/EditMetaStore';
 import type { Task } from '../types';
+import { parseDateOnly } from '../utils/dateOnly';
 
 describe('UiSidebar Blur-to-Save', () => {
     const taskId = '123';
@@ -36,9 +37,10 @@ describe('UiSidebar Blur-to-Save', () => {
             visibleColumns: ['id', 'subject', 'status', 'startDate'],
             activeInlineEdit: null
         });
-        useEditMetaStore.setState({ metaByTaskId: {}, loadingTaskId: null, error: null });
+        useEditMetaStore.setState({ metaByTaskId: {}, loadingByTaskId: {}, error: null });
 
         useTaskStore.setState({
+            autoSave: true,
             viewport: {
                 startDate: 0,
                 scrollX: 0,
@@ -55,10 +57,12 @@ describe('UiSidebar Blur-to-Save', () => {
         const task: Task = {
             id: taskId,
             subject: 'Initial Subject',
-            startDate: new Date('2025-01-01').getTime(),
-            dueDate: new Date('2025-01-05').getTime(),
+            startDate: parseDateOnly('2025-01-01')!,
+            dueDate: parseDateOnly('2025-01-05')!,
             ratioDone: 0,
             statusId: 1,
+            projectId: '1',
+            trackerId: 1,
             lockVersion: 1,
             editable: true,
             rowIndex: 0,

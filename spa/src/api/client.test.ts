@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { apiClient } from './client';
+import { addCalendarDays, diffCalendarDays, formatDateOnly, parseDateOnly } from '../utils/dateOnly';
+import { LayoutEngine } from '../engines/LayoutEngine';
+import { TaskLogicService } from '../services/TaskLogicService';
+import { configureBusinessCalendar } from '../utils/businessCalendar';
 
 describe('apiClient.fetchQueries', () => {
     afterEach(() => {
         vi.restoreAllMocks();
+        configureBusinessCalendar(null);
         delete window.RedmineCanvasGantt;
     });
 
@@ -45,6 +50,23 @@ describe('apiClient.fetchData', () => {
     afterEach(() => {
         vi.restoreAllMocks();
         delete window.RedmineCanvasGantt;
+    });
+
+    it('preserves the server request ID in an error response', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: 500,
+            statusText: 'Internal Server Error',
+            json: async () => ({ error: 'Unknown error (request ID: request-123)' })
+        }) as unknown as typeof fetch);
+
+        await expect(apiClient.fetchData()).rejects.toThrow('Unknown error (request ID: request-123)');
     });
 
     it('normalizes relations (from/to/id) to string', async () => {
@@ -208,11 +230,187 @@ describe('apiClient.fetchData', () => {
             tasksByIssueId: {
                 '10': {
                     issueId: '10',
-                    baselineStartDate: new Date('2026-04-10').getTime(),
-                    baselineDueDate: new Date('2026-04-15').getTime()
+                baselineStartDate: parseDateOnly('2026-04-10'),
+                baselineDueDate: parseDateOnly('2026-04-15')
                 }
             }
         });
+    });
+});
+
+describe('apiClient.fetchEditMeta', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        configureBusinessCalendar(null);
+        delete window.RedmineCanvasGantt;
+    });
+
+    it('preserves structured business calendar conflicts for draft previews', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json: async () => ({
+                status: 'conflict',
+                error: 'Business calendar changed',
+                failure: {
+                    kind: 'conflict',
+                    resource_role: 'scope',
+                    resource_type: 'business_calendar',
+                    resource_id: 'calendar-revision-2',
+                    remote_availability: 'needs_refresh'
+                }
+            })
+        }) as unknown as typeof fetch);
+
+        await expect(apiClient.fetchEditMeta('42', undefined, undefined, undefined, {
+            due_date: '2027-01-05',
+            lock_version: 1
+        })).rejects.toMatchObject({
+            name: 'ApiMutationError',
+            status: 'conflict',
+            httpStatus: 409,
+            failure: {
+                kind: 'conflict',
+                resourceRole: 'scope',
+                resourceType: 'business_calendar',
+                resourceId: 'calendar-revision-2',
+                remoteAvailability: 'needs_refresh'
+            }
+        });
+    });
+
+    it('keeps the HTTP conflict while discarding an unknown failure kind', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        const json = vi.fn().mockResolvedValue({
+            error: 'Business calendar changed',
+            failure: { kind: 'unexpected_kind', resource_role: 'scope' }
+        });
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json
+        }) as unknown as typeof fetch);
+
+        await expect(apiClient.fetchEditMeta('42')).rejects.toMatchObject({
+            name: 'ApiMutationError',
+            status: 'conflict',
+            httpStatus: 409,
+            message: 'Business calendar changed',
+            failure: undefined
+        });
+        expect(json).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('CalendarDate persistence invariant', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        delete window.RedmineCanvasGantt;
+    });
+
+    it('preserves DateOnly through load, timeline projection, move, scheduling, save, and reload', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token',
+            apiKey: 'key'
+        };
+        const payloadFor = (startDate: string, dueDate: string) => ({
+            tasks: [{
+                id: 10,
+                subject: 'DST task',
+                project_id: 1,
+                start_date: startDate,
+                due_date: dueDate,
+                ratio_done: 0,
+                status_id: 1,
+                lock_version: 0,
+                editable: true
+            }],
+            relations: [],
+            versions: [],
+            filter_options: { projects: [{ id: 1, name: 'P' }], assignees: [] },
+            statuses: [],
+            project: { id: 1, name: 'P' },
+            permissions: { editable: true, viewable: true, baseline_editable: true }
+        });
+        const fetchMock = vi.fn()
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => payloadFor('2026-03-07', '2026-03-09')
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => ({
+                    status: 'ok',
+                    completeness: 'partial',
+                    invalidated_entity_ids: [10],
+                    deleted_entity_ids: [99],
+                    lock_version: 1,
+                    task_id: 10
+                })
+            })
+            .mockResolvedValueOnce({
+                ok: true,
+                json: async () => payloadFor('2026-03-11', '2026-03-13')
+            });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        const loaded = await apiClient.fetchData();
+        const original = loaded.tasks[0];
+        const viewport = {
+            startDate: parseDateOnly('2026-03-01')!,
+            scrollX: 0,
+            scrollY: 0,
+            scale: 1 / (24 * 60 * 60 * 1000),
+            width: 800,
+            height: 600,
+            rowHeight: 32
+        };
+        expect(LayoutEngine.getTaskBounds(original, viewport).width).toBe(3);
+
+        const durationDays = diffCalendarDays(original.startDate!, original.dueDate!);
+        const movedStart = addCalendarDays(original.startDate!, 4);
+        const movedDue = addCalendarDays(movedStart, durationDays);
+        const movedTask = { ...original, startDate: movedStart, dueDate: movedDue };
+        expect(TaskLogicService.checkDependencies(
+            [movedTask],
+            [],
+            movedTask.id,
+            movedStart,
+            movedDue
+        )).toEqual({ updates: new Map() });
+
+        await expect(apiClient.updateTask(movedTask)).resolves.toMatchObject({
+            status: 'ok',
+            completeness: 'partial',
+            invalidatedEntityIds: ['10'],
+            deletedEntityIds: ['99']
+        });
+        const saveRequest = fetchMock.mock.calls[1]?.[1] as RequestInit;
+        expect(JSON.parse(String(saveRequest.body)).task).toMatchObject({
+            start_date: '2026-03-11',
+            due_date: '2026-03-13'
+        });
+
+        const reloaded = await apiClient.fetchData();
+        expect(formatDateOnly(reloaded.tasks[0].startDate)).toBe('2026-03-11');
+        expect(formatDateOnly(reloaded.tasks[0].dueDate)).toBe('2026-03-13');
+        expect(diffCalendarDays(reloaded.tasks[0].startDate!, reloaded.tasks[0].dueDate!)).toBe(durationDays);
     });
 });
 
@@ -280,7 +478,7 @@ describe('apiClient.createRelation', () => {
         expect(fetchMock).toHaveBeenCalledWith('/canvas_gantt/relations.json?canvas_project_id=1', expect.objectContaining({
             method: 'POST'
         }));
-        expect(rel).toEqual({ id: '1', from: '10', to: '11', type: 'precedes', delay: undefined });
+        expect(rel).toEqual({ status: 'ok', id: '1', from: '10', to: '11', type: 'precedes', delay: undefined });
     });
 
     it('parses relation id when API returns plain object', async () => {
@@ -302,7 +500,7 @@ describe('apiClient.createRelation', () => {
         expect(fetchMock).toHaveBeenCalledWith('/canvas_gantt/relations.json?canvas_project_id=1', expect.objectContaining({
             method: 'POST'
         }));
-        expect(rel).toEqual({ id: '2', from: '10', to: '11', type: 'precedes', delay: 0 });
+        expect(rel).toEqual({ status: 'ok', id: '2', from: '10', to: '11', type: 'precedes', delay: 0 });
     });
 
     it('prefers issue_from_id over issue_id when both are present', async () => {
@@ -330,7 +528,7 @@ describe('apiClient.createRelation', () => {
         vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
 
         const rel = await apiClient.createRelation('10', '11', 'precedes');
-        expect(rel).toEqual({ id: '4', from: '10', to: '11', type: 'precedes', delay: undefined });
+        expect(rel).toEqual({ status: 'ok', id: '4', from: '10', to: '11', type: 'precedes', delay: undefined });
     });
 });
 
@@ -362,7 +560,7 @@ describe('apiClient.updateRelation', () => {
         expect(fetchMock).toHaveBeenCalledWith('/canvas_gantt/relations/3.json?canvas_project_id=1', expect.objectContaining({
             method: 'PATCH'
         }));
-        expect(rel).toEqual({ id: '3', from: '10', to: '11', type: 'blocks', delay: undefined });
+        expect(rel).toEqual({ status: 'ok', id: '3', from: '10', to: '11', type: 'blocks', delay: undefined });
     });
 });
 
@@ -426,6 +624,302 @@ describe('apiClient.saveBaseline', () => {
                 tasksByIssueId: {}
             },
             warnings: ['baseline warning']
+        });
+    });
+
+    it('preserves the typed mutation status for baseline failures', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+
+        const fetchMock = vi.fn().mockResolvedValue({
+            ok: false,
+            status: 403,
+            statusText: 'Forbidden',
+            json: async () => ({ error: 'Baseline permission denied' })
+        });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        await expect(apiClient.saveBaseline({ scope: 'project' }))
+            .rejects.toMatchObject({
+                name: 'ApiMutationError',
+                status: 'forbidden',
+                httpStatus: 403,
+                message: 'Baseline permission denied'
+            });
+    });
+});
+
+describe('apiClient.deleteTask', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        delete window.RedmineCanvasGantt;
+    });
+
+    it('deletes through the session-authenticated Canvas Gantt endpoint', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+
+        const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        const result = await apiClient.deleteTask('42');
+
+        expect(fetchMock).toHaveBeenCalledWith('/canvas_gantt/tasks/42.json?canvas_project_id=1', expect.objectContaining({
+            method: 'DELETE',
+            credentials: 'same-origin',
+            headers: expect.any(Headers)
+        }));
+        const requestInit = fetchMock.mock.calls[0][1] as RequestInit;
+        expect(new Headers(requestInit.headers).get('X-CSRF-Token')).toBe('token');
+        expect(result).toEqual({ status: 'ok' });
+    });
+});
+
+describe('mutation error classification', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+        delete window.RedmineCanvasGantt;
+    });
+
+    it.each([
+        [403, 'forbidden'],
+        [404, 'not_found'],
+        [422, 'validation_error'],
+        [500, 'transient_error']
+    ] as const)('classifies HTTP %s as %s', async (httpStatus, expectedStatus) => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: httpStatus,
+            statusText: 'Request failed',
+            json: async () => ({ error: 'operation failed' })
+        }) as unknown as typeof fetch);
+
+        await expect(apiClient.updateTaskFields('42', { subject: 'draft' })).resolves.toMatchObject({
+            status: expectedStatus,
+            error: 'operation failed'
+        });
+    });
+
+    it('sends the optional operation id outside the legacy task payload', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        const fetchMock = vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({ lock_version: 4, task_id: 42 })
+        });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        await apiClient.updateTaskFields('42', { subject: 'draft' }, 'mutation:42');
+
+        const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+        expect(JSON.parse(String(request.body))).toEqual({
+            task: { subject: 'draft' },
+            client_operation_id: 'mutation:42'
+        });
+    });
+
+    it('classifies a malformed HTTP 409 as conflict without manufacturing view state', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json: async () => ({})
+        }) as unknown as typeof fetch);
+
+        const result = await apiClient.updateTaskFields('42', { subject: 'draft' });
+
+        expect(result.status).toBe('conflict');
+        expect(result.entity).toBeUndefined();
+    });
+
+    it('normalizes schedule conflict scope from the server contract', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: false,
+            status: 409,
+            statusText: 'Conflict',
+            json: async () => ({
+                status: 'conflict',
+                operation_id: 'schedule:1',
+                entities: [],
+                revisions: {},
+                conflict: { task_id: 42, expected_revision: 1, actual_revision: 2 }
+            })
+        }) as unknown as typeof fetch);
+
+        const result = await apiClient.scheduleMutation([
+            { taskId: '42', baseRevision: 1, dueDate: 11 }
+        ], 'schedule:1');
+
+        expect(result.conflict).toEqual({ taskId: '42', expectedRevision: 1, actualRevision: 2 });
+    });
+
+    it('sends the configured business calendar revision with mutations', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        configureBusinessCalendar({
+            status: 'ok',
+            revision: 'calendar-revision-2',
+            default_calendar_id: null,
+            project_calendar_ids: {},
+            calendars: {},
+            warnings: []
+        });
+        const fetchMock = vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                status: 'ok',
+                operation_id: 'schedule:calendar',
+                entities: [],
+                revisions: {}
+            })
+        });
+        vi.stubGlobal('fetch', fetchMock as unknown as typeof fetch);
+
+        await apiClient.scheduleMutation([
+            { taskId: '42', baseRevision: 1, dueDate: 11 }
+        ], 'schedule:calendar');
+
+        const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+        expect(new Headers(request.headers).get('X-Redmine-Canvas-Gantt-Calendar-Revision'))
+            .toBe('calendar-revision-2');
+    });
+
+    it('keeps mutation entities persisted-only', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                status: 'ok',
+                entity: { id: 42, subject: 'Saved', lock_version: 4 }
+            })
+        }) as unknown as typeof fetch);
+
+        const result = await apiClient.updateTaskFields('42', { subject: 'Saved' });
+
+        expect(result.entity).toEqual({ id: '42', subject: 'Saved', lockVersion: 4 });
+        expect(result.entity).not.toHaveProperty('editable');
+        expect(result.entity).not.toHaveProperty('rowIndex');
+        expect(result.entity).not.toHaveProperty('hasChildren');
+    });
+
+    it('preserves explicit nullable clears while keeping omitted fields absent', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                status: 'ok',
+                entity: {
+                    id: 42,
+                    due_date: null,
+                    parent_id: null,
+                    category_id: null,
+                    category_name: null,
+                    estimated_hours: null,
+                    fixed_version_id: null,
+                    fixed_version_name: null
+                }
+            })
+        }) as unknown as typeof fetch);
+
+        const result = await apiClient.updateTaskFields('42', { due_date: null });
+
+        expect(result.entity).toHaveProperty('dueDate', undefined);
+        expect(result.entity).toHaveProperty('parentId', undefined);
+        expect(result.entity).toHaveProperty('categoryId', undefined);
+        expect(result.entity).toHaveProperty('categoryName', undefined);
+        expect(result.entity).toHaveProperty('estimatedHours', undefined);
+        expect(result.entity).toHaveProperty('fixedVersionId', undefined);
+        expect(result.entity).toHaveProperty('fixedVersionName', undefined);
+        expect(result.entity).not.toHaveProperty('startDate');
+    });
+
+    it('keeps omitted nullable category and version fields absent', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({
+                status: 'ok',
+                entity: { id: 42, subject: 'Unchanged' }
+            })
+        }) as unknown as typeof fetch);
+
+        const result = await apiClient.updateTaskFields('42', { subject: 'Unchanged' });
+
+        expect(result.entity).not.toHaveProperty('categoryId');
+        expect(result.entity).not.toHaveProperty('categoryName');
+        expect(result.entity).not.toHaveProperty('fixedVersionId');
+        expect(result.entity).not.toHaveProperty('fixedVersionName');
+    });
+
+    it('rejects unknown mutation status strings as protocol errors', async () => {
+        window.RedmineCanvasGantt = {
+            projectId: 1,
+            apiBase: '/projects/1/canvas_gantt',
+            redmineBase: '',
+            authToken: 'token'
+        };
+        vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+            ok: true,
+            status: 200,
+            json: async () => ({ status: 'future_status' })
+        }) as unknown as typeof fetch);
+
+        await expect(apiClient.updateTaskFields('42', { subject: 'draft' })).resolves.toMatchObject({
+            status: 'protocol_error'
         });
     });
 });

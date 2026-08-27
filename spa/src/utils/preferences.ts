@@ -13,6 +13,8 @@ export interface StoredPreferences {
     showTaskBarDates?: boolean;
     showHierarchyLines?: boolean;
     showPointsOrphans?: boolean;
+    showStartDateOnly?: boolean;
+    showDueDateOnly?: boolean;
     showVersions?: boolean;
     showBaseline?: boolean;
     selectedStatusIds?: number[];
@@ -48,6 +50,8 @@ export interface StoredDisplayPreferences {
     showTaskBarDates?: boolean;
     showHierarchyLines?: boolean;
     showPointsOrphans?: boolean;
+    showStartDateOnly?: boolean;
+    showDueDateOnly?: boolean;
     showVersions?: boolean;
     showBaseline?: boolean;
     visibleColumns?: string[];
@@ -59,6 +63,7 @@ export interface StoredDisplayPreferences {
     rowHeight?: number;
     sidebarFontSize?: number;
     memberProjectsOnly?: boolean;
+    autoSave?: boolean;
 }
 
 export interface StoredGeneralPreferences {
@@ -89,6 +94,8 @@ export type DisplayPreferencesSnapshot = Pick<
     | 'showTaskBarDates'
     | 'showHierarchyLines'
     | 'showPointsOrphans'
+    | 'showStartDateOnly'
+    | 'showDueDateOnly'
     | 'showVersions'
     | 'showBaseline'
     | 'visibleColumns'
@@ -100,6 +107,7 @@ export type DisplayPreferencesSnapshot = Pick<
     | 'rowHeight'
     | 'sidebarFontSize'
     | 'memberProjectsOnly'
+    | 'autoSave'
 >;
 
 export type GeneralPreferencesSnapshot = Pick<
@@ -125,6 +133,8 @@ const sanitizePreferences = (prefs: StoredPreferences): StoredPreferences => Obj
         showTaskBarDates: prefs.showTaskBarDates,
         showHierarchyLines: prefs.showHierarchyLines,
         showPointsOrphans: prefs.showPointsOrphans,
+        showStartDateOnly: prefs.showStartDateOnly,
+        showDueDateOnly: prefs.showDueDateOnly,
         showVersions: prefs.showVersions,
         showBaseline: prefs.showBaseline,
         visibleColumns: prefs.visibleColumns,
@@ -158,6 +168,8 @@ const sanitizeDisplayPreferences = (prefs: StoredPreferences): StoredDisplayPref
         showTaskBarDates: prefs.showTaskBarDates,
         showHierarchyLines: prefs.showHierarchyLines,
         showPointsOrphans: prefs.showPointsOrphans,
+        showStartDateOnly: prefs.showStartDateOnly,
+        showDueDateOnly: prefs.showDueDateOnly,
         showVersions: prefs.showVersions,
         showBaseline: prefs.showBaseline,
         visibleColumns: prefs.visibleColumns,
@@ -168,7 +180,8 @@ const sanitizeDisplayPreferences = (prefs: StoredPreferences): StoredDisplayPref
         customScales: prefs.customScales,
         rowHeight: prefs.rowHeight,
         sidebarFontSize: prefs.sidebarFontSize,
-        memberProjectsOnly: prefs.memberProjectsOnly
+        memberProjectsOnly: prefs.memberProjectsOnly,
+        autoSave: prefs.autoSave
     }).filter(([, value]) => value !== undefined)
 ) as StoredDisplayPreferences;
 
@@ -398,8 +411,8 @@ export const loadDisplayPreferences = (projectId?: string | number | null): Stor
     loadDisplayPreferencesWithSource(projectId).preferences;
 
 export const loadPreferences = (projectId?: string | number | null): StoredPreferences => sanitizePreferences({
-    ...loadDisplayPreferences(projectId),
-    ...loadGeneralPreferences(projectId)
+    ...loadGeneralPreferences(projectId),
+    ...loadDisplayPreferences(projectId)
 });
 
 export const savePreferences = (prefs: StoredPreferences, projectId?: string | number | null) => {

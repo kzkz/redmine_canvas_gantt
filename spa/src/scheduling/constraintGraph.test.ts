@@ -86,6 +86,17 @@ describe('constraintGraph', () => {
         expect([...cyclicTaskIds].sort()).toEqual(['A', 'B', 'C']);
     });
 
+    it('does not classify cycle downstream or independent components as cycle members', () => {
+        const cyclicTaskIds = detectConstraintCycleTaskIds([
+            { id: 'ab', from: 'A', to: 'B', type: RelationType.Precedes },
+            { id: 'ba', from: 'B', to: 'A', type: RelationType.Precedes },
+            { id: 'bc', from: 'B', to: 'C', type: RelationType.Precedes },
+            { id: 'de', from: 'D', to: 'E', type: RelationType.Precedes }
+        ]);
+
+        expect([...cyclicTaskIds].sort()).toEqual(['A', 'B']);
+    });
+
     it('derives unscheduled, conflicted, and cyclic task states', () => {
         const tasks = [
             buildTask({ id: 'A', dueDate: DAY * 2 }),
@@ -122,5 +133,27 @@ describe('constraintGraph', () => {
         expect(updates.get('B')).toEqual({ startDate: TUESDAY, dueDate: WEDNESDAY });
         expect(updates.get('C')).toEqual({ startDate: THURSDAY, dueDate: FRIDAY });
         expect(updates.has('A')).toBe(false);
+    });
+
+    it('preserves the successor working-day duration when pushing across a weekend', () => {
+        const originalConfig = window.RedmineCanvasGantt;
+        window.RedmineCanvasGantt = {
+            ...(originalConfig || {}),
+            nonWorkingWeekDays: [0, 6]
+        } as Window['RedmineCanvasGantt'];
+        const monday = Date.UTC(2026, 0, 12);
+        const tuesday = Date.UTC(2026, 0, 13);
+        const tasks = [
+            buildTask({ id: 'A', startDate: THURSDAY, dueDate: FRIDAY }),
+            buildTask({ id: 'B', startDate: FRIDAY, dueDate: monday })
+        ];
+        const relations: Relation[] = [
+            { id: 'r1', from: 'A', to: 'B', type: RelationType.Precedes }
+        ];
+
+        const updates = recalculateDownstreamTasks(tasks, relations, 'A');
+
+        expect(updates.get('B')).toEqual({ startDate: monday, dueDate: tuesday });
+        window.RedmineCanvasGantt = originalConfig;
     });
 });

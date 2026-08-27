@@ -1,7 +1,13 @@
 import type { Relation, Task } from '../types';
 import { RelationType } from '../types/constraints';
 import { i18n } from '../utils/i18n';
-import { getNonWorkingWeekDays } from '../utils/nonWorkingWeekDays';
+import {
+    addWorkingDays,
+    diffWorkingDays,
+    shiftByWorkingDays
+} from '../utils/businessCalendar';
+
+export { addWorkingDays, diffWorkingDays, shiftByWorkingDays };
 
 export type SchedulingState = 'normal' | 'unscheduled' | 'invalid' | 'conflicted' | 'cyclic';
 
@@ -24,67 +30,6 @@ const severityByState: Record<SchedulingState, number> = {
     conflicted: 2,
     cyclic: 3,
     invalid: 4
-};
-
-const toUtcDayStart = (timestamp: number): Date => {
-    const date = new Date(timestamp);
-    date.setUTCHours(0, 0, 0, 0);
-    return date;
-};
-
-export const addWorkingDays = (timestamp: number, days: number, nonWorkingWeekDays: Set<number> = getNonWorkingWeekDays()): number => {
-    const date = toUtcDayStart(timestamp);
-    let remaining = Math.max(0, Math.floor(days));
-
-    while (remaining > 0) {
-        date.setUTCDate(date.getUTCDate() + 1);
-        if (!nonWorkingWeekDays.has(date.getUTCDay())) {
-            remaining -= 1;
-        }
-    }
-
-    return date.getTime();
-};
-
-export const shiftByWorkingDays = (timestamp: number, days: number, nonWorkingWeekDays: Set<number> = getNonWorkingWeekDays()): number => {
-    const normalizedDays = Math.trunc(days);
-    if (normalizedDays === 0) return toUtcDayStart(timestamp).getTime();
-    if (normalizedDays > 0) return addWorkingDays(timestamp, normalizedDays, nonWorkingWeekDays);
-
-    const date = toUtcDayStart(timestamp);
-    let remaining = Math.abs(normalizedDays);
-
-    while (remaining > 0) {
-        date.setUTCDate(date.getUTCDate() - 1);
-        if (!nonWorkingWeekDays.has(date.getUTCDay())) {
-            remaining -= 1;
-        }
-    }
-
-    return date.getTime();
-};
-
-export const diffWorkingDays = (fromTimestamp: number, toTimestamp: number, nonWorkingWeekDays: Set<number> = getNonWorkingWeekDays()): number => {
-    const from = toUtcDayStart(fromTimestamp);
-    const to = toUtcDayStart(toTimestamp);
-    const fromTime = from.getTime();
-    const toTime = to.getTime();
-
-    if (fromTime === toTime) return 0;
-
-    const step = fromTime < toTime ? 1 : -1;
-    let current = from;
-    let delta = 0;
-
-    while (current.getTime() !== toTime) {
-        current = new Date(current.getTime());
-        current.setUTCDate(current.getUTCDate() + step);
-        if (!nonWorkingWeekDays.has(current.getUTCDay())) {
-            delta += step;
-        }
-    }
-
-    return delta;
 };
 
 const hasFiniteDate = (value: number | undefined): value is number => Number.isFinite(value);
@@ -137,8 +82,16 @@ export const buildSchedulingEdges = (relations: Relation[]): SchedulingEdge[] =>
         .filter((edge): edge is SchedulingEdge => Boolean(edge))
 );
 
-export const detectConstraintCycleTaskIds = (relations: Relation[]): Set<string> => {
-    const edges = buildSchedulingEdges(relations);
+/**
+ * Return only nodes that belong to a directed cycle.
+ *
+ * Kahn's algorithm is useful for calculating a topological order, but its
+ * remaining nodes are not all cycle members: a node downstream of a cycle
+ * remains unprocessed as well.  Remove the acyclic prefix first, then walk
+ * the residual graph iteratively so deep dependency chains do not depend on
+ * the JavaScript call stack.
+ */
+export const detectSchedulingCycleTaskIds = (edges: SchedulingEdge[]): Set<string> => {
     const adjacency = new Map<string, string[]>();
     const taskIds = new Set<string>();
 
@@ -150,34 +103,87 @@ export const detectConstraintCycleTaskIds = (relations: Relation[]): Set<string>
         adjacency.set(edge.predecessorId, successors);
     });
 
+    const indegree = new Map<string, number>([...taskIds].map((taskId) => [taskId, 0]));
+    edges.forEach((edge) => {
+        indegree.set(edge.successorId, (indegree.get(edge.successorId) ?? 0) + 1);
+    });
+
+    const queue = [...taskIds].filter((taskId) => indegree.get(taskId) === 0);
+    const removed = new Set<string>();
+    for (let queueIndex = 0; queueIndex < queue.length; queueIndex += 1) {
+        const taskId = queue[queueIndex];
+        removed.add(taskId);
+        (adjacency.get(taskId) ?? []).forEach((successorId) => {
+            const nextIndegree = (indegree.get(successorId) ?? 0) - 1;
+            indegree.set(successorId, nextIndegree);
+            if (nextIndegree === 0) queue.push(successorId);
+        });
+    }
+
+    const residualTaskIds = new Set([...taskIds].filter((taskId) => !removed.has(taskId)));
+    const residualAdjacency = new Map<string, string[]>();
+    residualTaskIds.forEach((taskId) => {
+        residualAdjacency.set(
+            taskId,
+            (adjacency.get(taskId) ?? []).filter((successorId) => residualTaskIds.has(successorId))
+        );
+    });
     const state = new Map<string, 0 | 1 | 2>();
-    const stack: string[] = [];
     const cyclicTaskIds = new Set<string>();
 
-    const visit = (taskId: string) => {
-        const currentState = state.get(taskId) ?? 0;
-        if (currentState === 1) {
-            const cycleStart = stack.lastIndexOf(taskId);
-            const cycleSlice = cycleStart >= 0 ? stack.slice(cycleStart) : [taskId];
-            cycleSlice.forEach((value) => cyclicTaskIds.add(value));
-            cyclicTaskIds.add(taskId);
-            return;
+    residualTaskIds.forEach((startTaskId) => {
+        if ((state.get(startTaskId) ?? 0) !== 0) return;
+
+        const path: string[] = [];
+        const pathIndexes = new Map<string, number>();
+        const frames: Array<{ taskId: string; nextSuccessorIndex: number }> = [];
+        state.set(startTaskId, 1);
+        path.push(startTaskId);
+        pathIndexes.set(startTaskId, 0);
+        frames.push({ taskId: startTaskId, nextSuccessorIndex: 0 });
+
+        while (frames.length > 0) {
+            const frame = frames[frames.length - 1];
+            const successors = residualAdjacency.get(frame.taskId) ?? [];
+
+            if (frame.nextSuccessorIndex >= successors.length) {
+                state.set(frame.taskId, 2);
+                frames.pop();
+                const pathIndex = pathIndexes.get(frame.taskId);
+                if (pathIndex !== undefined && path[path.length - 1] === frame.taskId) {
+                    path.pop();
+                    pathIndexes.delete(frame.taskId);
+                }
+                continue;
+            }
+
+            const successorId = successors[frame.nextSuccessorIndex];
+            frame.nextSuccessorIndex += 1;
+            const successorState = state.get(successorId) ?? 0;
+
+            if (successorState === 0) {
+                state.set(successorId, 1);
+                pathIndexes.set(successorId, path.length);
+                path.push(successorId);
+                frames.push({ taskId: successorId, nextSuccessorIndex: 0 });
+                continue;
+            }
+
+            if (successorState === 1) {
+                const cycleStart = pathIndexes.get(successorId);
+                if (cycleStart !== undefined) {
+                    path.slice(cycleStart).forEach((taskId) => cyclicTaskIds.add(taskId));
+                }
+            }
         }
+    });
 
-        if (currentState === 2) return;
-
-        state.set(taskId, 1);
-        stack.push(taskId);
-
-        (adjacency.get(taskId) ?? []).forEach((successorId) => visit(successorId));
-
-        stack.pop();
-        state.set(taskId, 2);
-    };
-
-    taskIds.forEach((taskId) => visit(taskId));
     return cyclicTaskIds;
 };
+
+export const detectConstraintCycleTaskIds = (relations: Relation[]): Set<string> => (
+    detectSchedulingCycleTaskIds(buildSchedulingEdges(relations))
+);
 
 const applyState = (
     states: Record<string, SchedulingStateInfo>,
@@ -237,7 +243,6 @@ export const deriveSchedulingStates = (tasks: Task[], relations: Relation[]): Re
         );
     });
 
-    const nonWorkingWeekDays = getNonWorkingWeekDays();
     edges.forEach((edge) => {
         const predecessor = taskById.get(edge.predecessorId);
         const successor = taskById.get(edge.successorId);
@@ -247,7 +252,7 @@ export const deriveSchedulingStates = (tasks: Task[], relations: Relation[]): Re
 
         const predecessorDueDate = predecessor.dueDate!;
         const successorStartDate = successor.startDate!;
-        const minimumSuccessorStart = addWorkingDays(predecessorDueDate, edge.gapDays, nonWorkingWeekDays);
+        const minimumSuccessorStart = addWorkingDays(predecessorDueDate, edge.gapDays, successor.projectId);
         if (successorStartDate < minimumSuccessorStart) {
             const message = i18n.t('label_scheduling_state_conflicted') || 'This task violates a scheduling dependency.';
             applyState(states, predecessor.id, 'conflicted', message);
@@ -265,7 +270,6 @@ export const recalculateDownstreamTasks = (
 ): Map<string, Partial<Task>> => {
     const taskById = new Map(tasks.map((task) => [task.id, { ...task }]));
     const outgoing = new Map<string, SchedulingEdge[]>();
-    const nonWorkingWeekDays = getNonWorkingWeekDays();
     const updates = new Map<string, Partial<Task>>();
 
     buildSchedulingEdges(relations).forEach((edge) => {
@@ -291,12 +295,20 @@ export const recalculateDownstreamTasks = (
             if (!successor || !hasValidDateRange(successor)) return;
             const successorStartDate = successor.startDate!;
             const successorDueDate = successor.dueDate!;
-            const minimumSuccessorStart = addWorkingDays(predecessorDueDate, edge.gapDays, nonWorkingWeekDays);
+            const minimumSuccessorStart = addWorkingDays(predecessorDueDate, edge.gapDays, successor.projectId);
             if (successorStartDate >= minimumSuccessorStart) return;
 
-            const duration = Math.max(0, successorDueDate - successorStartDate);
+            const duration = diffWorkingDays(
+                successorStartDate,
+                successorDueDate,
+                successor.projectId
+            );
             const nextStartDate = minimumSuccessorStart;
-            const nextDueDate = nextStartDate + duration;
+            const nextDueDate = shiftByWorkingDays(
+                nextStartDate,
+                duration,
+                successor.projectId
+            );
             const nextSuccessor = {
                 ...successor,
                 startDate: nextStartDate,
@@ -326,10 +338,10 @@ export const calculateLinkedDownstreamUpdates = (
         return { updates: new Map() };
     }
 
-    const nonWorkingWeekDays = getNonWorkingWeekDays();
-    const previousDownstreamAnchor = addWorkingDays(previousDueDate, 1, nonWorkingWeekDays);
-    const nextDownstreamAnchor = addWorkingDays(nextDueDate, 1, nonWorkingWeekDays);
-    const workingDayDelta = diffWorkingDays(previousDownstreamAnchor, nextDownstreamAnchor, nonWorkingWeekDays);
+    const originProjectId = tasks.find((task) => task.id === originTaskId)?.projectId;
+    const previousDownstreamAnchor = addWorkingDays(previousDueDate, 1, originProjectId);
+    const nextDownstreamAnchor = addWorkingDays(nextDueDate, 1, originProjectId);
+    const workingDayDelta = diffWorkingDays(previousDownstreamAnchor, nextDownstreamAnchor, originProjectId);
     if (workingDayDelta === 0) {
         return { updates: new Map() };
     }
@@ -366,15 +378,18 @@ export const calculateLinkedDownstreamUpdates = (
         if (!task || !hasValidDateRange(task)) return;
 
         updates.set(taskId, {
-            startDate: shiftByWorkingDays(task.startDate!, workingDayDelta, nonWorkingWeekDays),
-            dueDate: shiftByWorkingDays(task.dueDate!, workingDayDelta, nonWorkingWeekDays)
+            startDate: shiftByWorkingDays(task.startDate!, workingDayDelta, task.projectId),
+            dueDate: shiftByWorkingDays(task.dueDate!, workingDayDelta, task.projectId)
         });
     });
 
     for (const edge of edges) {
-        if (!clusterTaskIds.has(edge.successorId) || clusterTaskIds.has(edge.predecessorId)) continue;
+        if (!clusterTaskIds.has(edge.successorId)) continue;
 
-        const predecessor = taskById.get(edge.predecessorId);
+        const predecessorTask = taskById.get(edge.predecessorId);
+        const predecessor = predecessorTask && updates.has(edge.predecessorId)
+            ? { ...predecessorTask, ...updates.get(edge.predecessorId) }
+            : predecessorTask;
         const successor = taskById.get(edge.successorId);
         const shiftedSuccessor = updates.get(edge.successorId);
         if (!predecessor || !successor || !shiftedSuccessor) continue;
@@ -389,7 +404,7 @@ export const calculateLinkedDownstreamUpdates = (
             };
         }
 
-        const minimumSuccessorStart = addWorkingDays(predecessor.dueDate!, edge.gapDays, nonWorkingWeekDays);
+        const minimumSuccessorStart = addWorkingDays(predecessor.dueDate!, edge.gapDays, successor.projectId);
         if (shiftedStartDate < minimumSuccessorStart) {
             return {
                 updates: new Map(),

@@ -46,6 +46,21 @@ module RedmineCanvasGantt
       }
     end
 
+    def with_task_states(visible_issue_ids)
+      visible_ids = Array(visible_issue_ids).each_with_object({}) do |issue_id, result|
+        result[issue_id.to_i] = true
+      end
+      self.class.new(
+        snapshot_id: snapshot_id,
+        project_id: project_id,
+        captured_at: captured_at,
+        captured_by_id: captured_by_id,
+        captured_by_name: captured_by_name,
+        scope: scope,
+        task_states: task_states.select { |task_state| visible_ids.key?(task_state.issue_id) }
+      )
+    end
+
     private
 
     def normalize_time(value)

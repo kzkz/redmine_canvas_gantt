@@ -5,6 +5,8 @@ import { getGridScales } from '../utils/grid';
 import { canvasFonts, designTokens } from '../styles/designTokens';
 import { resizeCanvasForDpr, snapTextPosition, snapLinePosition } from '../utils/canvasDpr';
 import { isJapaneseHoliday, japaneseHolidayName } from '../utils/japaneseHolidays';
+import { getDayInfo } from '../utils/businessCalendar';
+import { GANTT_HEADER_HEIGHT } from '../constants';
 
 export interface TimelineHeaderHandle {
     getCanvas: () => HTMLCanvasElement | null;
@@ -22,7 +24,7 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
         if (!ctx) return;
 
         const cssWidth = Math.max(0, Math.floor(viewport.width));
-        const cssHeight = 48;
+        const cssHeight = GANTT_HEADER_HEIGHT;
 
         // Clear
         ctx.clearRect(0, 0, cssWidth, cssHeight);
@@ -43,14 +45,15 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
 
         const activeRows = [hasTop, hasMiddle, hasBottom].filter(Boolean).length;
         const rowHeight = activeRows > 0 ? cssHeight / activeRows : cssHeight;
+        const dayHeaderExtraHeight = hasMiddle && hasBottom ? 2 : 0;
 
         let currentY = 0;
 
-        const drawRow = (ticks: typeof scales.top, bgColor: string, txtColor: string, align: 'left' | 'center' = 'left') => {
+        const drawRow = (ticks: typeof scales.top, bgColor: string, txtColor: string, align: 'left' | 'center' = 'left', height = rowHeight) => {
             if (ticks.length === 0) return;
 
             const y = currentY;
-            const h = rowHeight;
+            const h = height;
 
             // Background
             ctx.fillStyle = bgColor;
@@ -119,23 +122,24 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
         const middleAlign: 'left' | 'center' = 'left';
         const middleBg = zoomLevel === 0 ? designTokens.surfaceMuted : designTokens.appBg;
         const middleTxt = zoomLevel === 0 ? designTokens.textSecondary : designTokens.textPrimary;
-        if (hasMiddle) drawRow(scales.middle, middleBg, middleTxt, middleAlign);
+        if (hasMiddle) drawRow(scales.middle, middleBg, middleTxt, middleAlign, rowHeight - dayHeaderExtraHeight);
 
         if (hasBottom) {
             const y = currentY;
-            const h = rowHeight;
+            const h = rowHeight + dayHeaderExtraHeight;
 
             // Background (base)
             ctx.fillStyle = designTokens.appBg;
             ctx.fillRect(0, y, cssWidth, h);
 
-            // Weekends & Japanese holidays
+            // Non-working days: the business calendar (including project-specific
+            // holidays) plus the built-in Japanese holiday calculation.
             if (zoomLevel === 2) { // Day View mainly
                 scales.bottom.forEach((tick, i) => {
-                    const d = new Date(tick.time);
-                    const dow = d.getDay();
-                    const holiday = isJapaneseHoliday(d);
-                    if (holiday || dow === 0 || dow === 6) {
+                    const dayInfo = getDayInfo(tick.time, window.RedmineCanvasGantt?.projectId);
+                    const holiday = isJapaneseHoliday(new Date(tick.time))
+                        || (dayInfo.type === 'non_working' && dayInfo.source === 'override');
+                    if (dayInfo.type === 'non_working' || holiday) {
                         let w = 50; // default
                         if (i < scales.bottom.length - 1) w = scales.bottom[i + 1].x - tick.x;
                         else w = (24 * 3600 * 1000 * viewport.scale);
@@ -148,7 +152,6 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
 
             // Draw Ticks/Text
             ctx.fillStyle = designTokens.textPrimary;
-            ctx.font = canvasFonts.header;
             ctx.textAlign = 'center'; // Always center bottom (Days)
 
             scales.bottom.forEach((tick, i) => {
@@ -165,19 +168,31 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
                 const width = nextX - tick.x;
 
                 const textX = tick.x + width / 2;
-                const textY = y + h / 2 + 4;
+                const textY = tick.secondaryLabel ? y + 10 : y + h / 2 + 4;
 
-                // Colour day labels like a Japanese calendar: Sundays/holidays red,
-                // Saturdays blue (day view only; other zooms keep the base colour).
+                ctx.font = canvasFonts.header;
+                // Colour day labels like a Japanese calendar: Sundays and holidays
+                // red, Saturdays blue (day view only; other zooms keep the base
+                // colour). Calendar day overrides count as holidays, weekly
+                // non-working days do not.
                 if (zoomLevel === 2) {
                     const d = new Date(tick.time);
                     const dow = d.getDay();
-                    if (isJapaneseHoliday(d) || dow === 0) ctx.fillStyle = designTokens.dayLabelSunday;
+                    const info = getDayInfo(tick.time, window.RedmineCanvasGantt?.projectId);
+                    const holiday = isJapaneseHoliday(d)
+                        || (info.type === 'non_working' && info.source === 'override');
+                    if (holiday || dow === 0) ctx.fillStyle = designTokens.dayLabelSunday;
                     else if (dow === 6) ctx.fillStyle = designTokens.dayLabelSaturday;
                     else ctx.fillStyle = designTokens.textPrimary;
                 }
 
                 ctx.fillText(tick.label, snapTextPosition(textX), snapTextPosition(textY));
+                if (tick.secondaryLabel) {
+                    ctx.font = canvasFonts.header.replace('11px', '10px');
+                    ctx.fillStyle = designTokens.textSecondary;
+                    ctx.fillText(tick.secondaryLabel, snapTextPosition(textX), snapTextPosition(y + h - 3));
+                    ctx.fillStyle = designTokens.textPrimary;
+                }
             });
 
             currentY += h;
@@ -190,7 +205,7 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
         if (!canvasRef.current) return;
         const width = Math.max(0, Math.floor(viewport.width));
         const ctx = canvasRef.current.getContext('2d');
-        resizeCanvasForDpr(canvasRef.current, ctx, width, 48);
+        resizeCanvasForDpr(canvasRef.current, ctx, width, GANTT_HEADER_HEIGHT);
         renderHeader();
     }, [renderHeader, viewport.width]);
 
@@ -211,7 +226,13 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
         for (let i = 0; i < ticks.length; i++) {
             const nextX = i < ticks.length - 1 ? ticks[i + 1].x : Infinity;
             if (x >= ticks[i].x && x < nextX) {
-                text = japaneseHolidayName(new Date(ticks[i].time)) ?? '';
+                // Prefer the name configured in the business calendar; fall back to
+                // the built-in Japanese holiday name.
+                const info = getDayInfo(ticks[i].time, window.RedmineCanvasGantt?.projectId);
+                const calendarName = info.type === 'non_working' && info.source === 'override'
+                    ? info.name
+                    : null;
+                text = calendarName || japaneseHolidayName(new Date(ticks[i].time)) || '';
                 break;
             }
         }
@@ -220,10 +241,10 @@ export const TimelineHeader = React.forwardRef<TimelineHeaderHandle>((_, ref) =>
     const handleMouseLeave = useCallback(() => setHolidayTip(null), []);
 
     return (
-        <div style={{ height: 48, backgroundColor: designTokens.surfaceSubtle, borderBottom: `1px solid ${designTokens.borderSubtle}`, overflow: 'hidden' }}>
+        <div style={{ height: GANTT_HEADER_HEIGHT, boxSizing: 'border-box', flexShrink: 0, backgroundColor: designTokens.surfaceSubtle, borderBottom: `1px solid ${designTokens.borderSubtle}`, overflow: 'hidden' }}>
             <canvas
                 ref={canvasRef}
-                height={48}
+                height={GANTT_HEADER_HEIGHT}
                 style={{ display: 'block' }}
                 onMouseMove={handleMouseMove}
                 onMouseLeave={handleMouseLeave}

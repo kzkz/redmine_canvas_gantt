@@ -11,7 +11,8 @@ import {
     RELATION_HIT_TOLERANCE_PX,
     shouldRenderRelationsAtZoom
 } from '../renderers/relationGeometry';
-import { snapToUtcDay } from '../utils/time';
+import { timelineToCalendarDate } from '../utils/dateOnly';
+import { diffWorkingDays, normalizeWorkingDate, shiftByWorkingDays } from '../utils/businessCalendar';
 import { panViewportByPixels } from './viewportPan';
 
 type DragMode = 'none' | 'pan' | 'task-move' | 'task-resize-start' | 'task-resize-end';
@@ -31,7 +32,7 @@ interface DragState {
     taskId: string | null;
     originalStartDate: number | undefined;
     originalDueDate: number | undefined;
-    snapshot: Task[] | null;
+    barOperationId: string | null;
 }
 
 export class InteractionEngine {
@@ -43,7 +44,7 @@ export class InteractionEngine {
         taskId: null,
         originalStartDate: undefined,
         originalDueDate: undefined,
-        snapshot: null
+        barOperationId: null
     };
 
     constructor(container: HTMLElement) {
@@ -171,7 +172,7 @@ export class InteractionEngine {
     }
 
     private snapToDate(timestamp: number): number {
-        return snapToUtcDay(timestamp);
+        return timelineToCalendarDate(timestamp);
     }
 
     private isResizeIntent(
@@ -282,7 +283,7 @@ export class InteractionEngine {
                     taskId: resolvedHit.task.id,
                     originalStartDate: resolvedHit.task.startDate,
                     originalDueDate: resolvedHit.task.dueDate,
-                    snapshot: JSON.parse(JSON.stringify(useTaskStore.getState().allTasks))
+                    barOperationId: useTaskStore.getState().beginBarOperation(resolvedHit.task.id)
                 };
             } else if (resolvedHit.region === 'start') {
                 this.drag = {
@@ -292,7 +293,7 @@ export class InteractionEngine {
                     taskId: resolvedHit.task.id,
                     originalStartDate: resolvedHit.task.startDate,
                     originalDueDate: resolvedHit.task.dueDate,
-                    snapshot: JSON.parse(JSON.stringify(useTaskStore.getState().allTasks))
+                    barOperationId: useTaskStore.getState().beginBarOperation(resolvedHit.task.id)
                 };
             } else if (resolvedHit.region === 'end') {
                 this.drag = {
@@ -302,7 +303,7 @@ export class InteractionEngine {
                     taskId: resolvedHit.task.id,
                     originalStartDate: resolvedHit.task.startDate,
                     originalDueDate: resolvedHit.task.dueDate,
-                    snapshot: JSON.parse(JSON.stringify(useTaskStore.getState().allTasks))
+                    barOperationId: useTaskStore.getState().beginBarOperation(resolvedHit.task.id)
                 };
             }
         } else if (resolvedHit.task) {
@@ -318,7 +319,7 @@ export class InteractionEngine {
                 taskId: null,
                 originalStartDate: 0,
                 originalDueDate: 0,
-                snapshot: null
+                barOperationId: null
             };
         }
     };
@@ -379,19 +380,30 @@ export class InteractionEngine {
         } else if (this.drag.mode === 'task-move' && this.drag.taskId) {
             const timeDelta = dx / viewport.scale;
             const currentTask = useTaskStore.getState().tasks.find(t => t.id === this.drag.taskId);
+            const projectId = currentTask?.projectId;
 
             if (Number.isFinite(this.drag.originalStartDate) && Number.isFinite(this.drag.originalDueDate)) {
-                const newStart = this.snapToDate(this.drag.originalStartDate! + timeDelta);
-                const duration = this.drag.originalDueDate! - this.drag.originalStartDate!;
+                const candidateStart = this.snapToDate(this.drag.originalStartDate! + timeDelta);
+                const newStart = normalizeWorkingDate(candidateStart, 'forward', projectId);
+                const durationDays = diffWorkingDays(
+                    this.drag.originalStartDate!,
+                    this.drag.originalDueDate!,
+                    projectId
+                );
+                const newDue = shiftByWorkingDays(newStart, durationDays, projectId);
 
                 if (currentTask && currentTask.startDate !== newStart) {
                     updateTask(this.drag.taskId, {
                         startDate: newStart,
-                        dueDate: newStart + duration
+                        dueDate: newDue
                     });
                 }
             } else if (Number.isFinite(this.drag.originalStartDate)) {
-                const newStart = this.snapToDate(this.drag.originalStartDate! + timeDelta);
+                const newStart = normalizeWorkingDate(
+                    this.snapToDate(this.drag.originalStartDate! + timeDelta),
+                    'forward',
+                    projectId
+                );
                 if (currentTask && currentTask.startDate !== newStart) {
                     updateTask(this.drag.taskId, {
                         startDate: newStart
@@ -399,7 +411,11 @@ export class InteractionEngine {
                 }
             } else if (Number.isFinite(this.drag.originalDueDate)) {
                 // Determine delta based on drag start
-                const newDue = this.snapToDate(this.drag.originalDueDate! + timeDelta);
+                const newDue = normalizeWorkingDate(
+                    this.snapToDate(this.drag.originalDueDate! + timeDelta),
+                    'backward',
+                    projectId
+                );
                 if (currentTask && currentTask.dueDate !== newDue) {
                     updateTask(this.drag.taskId, {
                         dueDate: newDue
@@ -408,18 +424,24 @@ export class InteractionEngine {
             }
         } else if (this.drag.mode === 'task-resize-start' && this.drag.taskId) {
             const timeDelta = dx / viewport.scale;
-            const newStart = this.snapToDate(this.drag.originalStartDate! + timeDelta);
-
             const currentTask = useTaskStore.getState().tasks.find(t => t.id === this.drag.taskId);
+            const newStart = normalizeWorkingDate(
+                this.snapToDate(this.drag.originalStartDate! + timeDelta),
+                'forward',
+                currentTask?.projectId
+            );
 
             if (currentTask && newStart <= this.drag.originalDueDate! && currentTask.startDate !== newStart) {
                 updateTask(this.drag.taskId, { startDate: newStart });
             }
         } else if (this.drag.mode === 'task-resize-end' && this.drag.taskId) {
             const timeDelta = dx / viewport.scale;
-            const newEnd = this.snapToDate(this.drag.originalDueDate! + timeDelta);
-
             const currentTask = useTaskStore.getState().tasks.find(t => t.id === this.drag.taskId);
+            const newEnd = normalizeWorkingDate(
+                this.snapToDate(this.drag.originalDueDate! + timeDelta),
+                'backward',
+                currentTask?.projectId
+            );
 
             if (currentTask && newEnd >= this.drag.originalStartDate! && currentTask.dueDate !== newEnd) {
                 updateTask(this.drag.taskId, { dueDate: newEnd });
@@ -430,16 +452,18 @@ export class InteractionEngine {
     private handleMouseUp = async () => {
         const draggedTaskId = this.drag.taskId;
         const wasDragging = this.drag.mode !== 'none' && this.drag.mode !== 'pan' && draggedTaskId;
+        const barOperationId = this.drag.barOperationId;
 
 
         // Resume sorting (will trigger re-layout)
         useTaskStore.getState().setSortingSuspended(false);
 
-        this.drag = { mode: 'none', startX: 0, startY: 0, taskId: null, originalStartDate: undefined, originalDueDate: undefined, snapshot: null };
+        this.drag = { mode: 'none', startX: 0, startY: 0, taskId: null, originalStartDate: undefined, originalDueDate: undefined, barOperationId: null };
         this.container.style.cursor = DEFAULT_CURSOR;
 
         if (wasDragging && draggedTaskId) {
-            const { autoSave, saveChanges } = useTaskStore.getState();
+            const { autoSave, saveChanges, endBarOperation } = useTaskStore.getState();
+            if (barOperationId) endBarOperation(barOperationId);
             if (autoSave) {
                 saveChanges().catch(console.error);
             }

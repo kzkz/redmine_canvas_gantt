@@ -1,11 +1,15 @@
 import type { Task, Viewport, Bounds, ZoomLevel } from '../types';
-import { snapToLocalDay } from '../utils/time';
+import { timelineToCalendarDate, toTimelineDate, type CalendarDate, type TimelineDate } from '../utils/dateOnly';
+
+type CalendarCellPosition = 'start' | 'center' | 'end';
 
 export class LayoutEngine {
+  private static readonly ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
   /**
    * Converts a timestamp to an X coordinate relative to the start of the project timeline (scrollX=0).
    */
-  static dateToX(date: number, viewport: Viewport): number {
+  static dateToX(date: TimelineDate, viewport: Viewport): number {
     return (date - viewport.startDate) * viewport.scale;
     // Note: To get screen X, subtract viewport.scrollX
   }
@@ -13,21 +17,40 @@ export class LayoutEngine {
   /**
    * Converts an X coordinate (relative to timeline start) back to a timestamp.
    */
-  static xToDate(x: number, viewport: Viewport): number {
-    return x / viewport.scale + viewport.startDate;
+  static xToDate(x: number, viewport: Viewport): TimelineDate {
+    return (x / viewport.scale + viewport.startDate) as TimelineDate;
+  }
+
+  /**
+   * Projects a local calendar date onto the fixed-width UTC timeline used by the grid.
+   */
+  static calendarDateToTimeline(date: CalendarDate, position: CalendarCellPosition = 'start'): TimelineDate {
+    if (!Number.isFinite(date)) return Number.NaN as TimelineDate;
+
+    const cellStart = toTimelineDate(date);
+    const offset = position === 'center'
+      ? this.ONE_DAY_MS / 2
+      : position === 'end'
+        ? this.ONE_DAY_MS
+        : 0;
+
+    return (cellStart + offset) as TimelineDate;
+  }
+
+  static calendarDateToX(date: CalendarDate, viewport: Viewport, position: CalendarCellPosition = 'start'): number {
+    return this.dateToX(this.calendarDateToTimeline(date, position), viewport);
   }
 
   /**
    * Returns the screen bounding box for a task bar.
    */
-  public static snapDate(timestamp: number | undefined, _zoomLevel?: ZoomLevel): number {
+  public static snapDate(timestamp: number | undefined, _zoomLevel?: ZoomLevel): CalendarDate {
     void _zoomLevel;
-    if (timestamp === undefined || !Number.isFinite(timestamp)) return NaN;
-    return snapToLocalDay(timestamp);
+    if (timestamp === undefined || !Number.isFinite(timestamp)) return Number.NaN as CalendarDate;
+    return timelineToCalendarDate(timestamp);
   }
 
   static getTaskBounds(task: Task, viewport: Viewport, kind: 'bar' | 'hit' = 'bar', zoomLevel?: ZoomLevel): Bounds {
-    const ONE_DAY_MS = 24 * 60 * 60 * 1000;
     const start = task.startDate;
     const due = task.dueDate;
 
@@ -42,8 +65,7 @@ export class LayoutEngine {
       const date = Number.isFinite(start) ? start! : due!;
       const snappedDate = this.snapDate(date, zoomLevel);
       // Center single-date markers in the corresponding day cell.
-      const shiftedDate = snappedDate + ONE_DAY_MS / 2;
-      const cx = this.dateToX(shiftedDate, viewport) - viewport.scrollX;
+      const cx = this.calendarDateToX(snappedDate, viewport, 'center') - viewport.scrollX;
       const x = cx - POINT_SIZE / 2;
 
       if (kind === 'hit') {
@@ -57,13 +79,14 @@ export class LayoutEngine {
     }
 
     const snappedStart = this.snapDate(start, zoomLevel);
-    const snappedDue = Math.max(snappedStart, this.snapDate(due, zoomLevel));
-    // Add 1 day to make due date inclusive (bar ends at the END of due date, not the start)
-    const snappedDueInclusive = snappedDue + ONE_DAY_MS;
-    const x = this.dateToX(snappedStart, viewport) - viewport.scrollX;
+    const timelineStart = this.calendarDateToTimeline(snappedStart);
+    const timelineDue = Math.max(timelineStart, this.calendarDateToTimeline(this.snapDate(due, zoomLevel)));
+    // Add one fixed UTC timeline day to make the due date inclusive.
+    const timelineEnd = timelineDue + this.ONE_DAY_MS;
+    const x = this.dateToX(timelineStart, viewport) - viewport.scrollX;
     const y = task.rowIndex * viewport.rowHeight - viewport.scrollY;
     // Ensure width is at least something visible (e.g., 2px) even if duration is 0
-    const width = Math.max(2, (snappedDueInclusive - snappedStart) * viewport.scale);
+    const width = Math.max(2, (timelineEnd - timelineStart) * viewport.scale);
 
     if (kind === 'hit') {
       return { x, y, width, height: viewport.rowHeight };

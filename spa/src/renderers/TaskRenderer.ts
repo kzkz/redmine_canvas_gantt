@@ -5,13 +5,15 @@ import type { BaselineSnapshot } from '../types/baseline';
 import { calculateBaselineDiff, getBaselineTaskState } from '../utils/baseline';
 import { canvasFonts, designTokens } from '../styles/designTokens';
 import { getCanvasLogicalSize, snapTextPosition } from '../utils/canvasDpr';
+import { calendarDateKey, todayCalendarDate, type CalendarDate } from '../utils/dateOnly';
 
 export class TaskRenderer {
     private canvas: HTMLCanvasElement;
 
     private static readonly TASK_TITLE_OFFSET = 30;
-    private static readonly TASK_TITLE_OFFSET_WITH_DATES = 56;
-    private static readonly TASK_BAR_DATE_GAP = 6;
+    private static readonly TASK_TITLE_OFFSET_WITH_DATES = 42;
+    private static readonly TASK_BAR_DATE_GAP = 10;
+    private static readonly TASK_START_POINT_DATE_GAP = 14;
 
     // MiniMax standard-like bar colors
     private static readonly DONE_GREEN = designTokens.taskDone;
@@ -38,7 +40,10 @@ export class TaskRenderer {
         showTaskBarDates: boolean = false,
         showPointsOrphans: boolean = true,
         baselineSnapshot: BaselineSnapshot | null = null,
-        showBaseline: boolean = false
+        showBaseline: boolean = false,
+        showStartDateOnly: boolean = showPointsOrphans,
+        showDueDateOnly: boolean = showPointsOrphans,
+        today: CalendarDate = todayCalendarDate()
     ) {
         const ctx = this.canvas.getContext('2d');
         if (!ctx) return;
@@ -50,10 +55,7 @@ export class TaskRenderer {
 
         const visibleTasks = LayoutEngine.sliceTasksInRowRange(tasks, startRow, endRow);
 
-        const ONE_DAY = 24 * 60 * 60 * 1000;
-        const todayTs = new Date().setHours(0, 0, 0, 0);
-        const todayLineTs = todayTs + ONE_DAY;
-        const xTodayLine = LayoutEngine.dateToX(todayLineTs, viewport) - viewport.scrollX;
+        const xTodayLine = LayoutEngine.calendarDateToX(today, viewport, 'end') - viewport.scrollX;
 
         const showDependencyIndicators = zoomLevel === 0 || zoomLevel === 1;
         const dependencySummary = showDependencyIndicators ? buildDependencySummary(tasks, relations) : null;
@@ -65,8 +67,8 @@ export class TaskRenderer {
                     if (row.startDate !== undefined && row.dueDate !== undefined) {
                         const s = LayoutEngine.snapDate(row.startDate, zoomLevel);
                         const d = LayoutEngine.snapDate(row.dueDate, zoomLevel);
-                        const x1 = LayoutEngine.dateToX(s, viewport) - viewport.scrollX;
-                        const x2 = LayoutEngine.dateToX(d + ONE_DAY, viewport) - viewport.scrollX;
+                        const x1 = LayoutEngine.calendarDateToX(s, viewport, 'start') - viewport.scrollX;
+                        const x2 = LayoutEngine.calendarDateToX(d, viewport, 'end') - viewport.scrollX;
                         const y = row.rowIndex * viewport.rowHeight - viewport.scrollY;
                         this.drawProjectSummaryBar(ctx, x1, x2, y, viewport.rowHeight);
                     }
@@ -74,8 +76,8 @@ export class TaskRenderer {
                     if (row.startDate !== undefined && row.dueDate !== undefined) {
                         const s = LayoutEngine.snapDate(row.startDate, zoomLevel);
                         const d = LayoutEngine.snapDate(row.dueDate, zoomLevel);
-                        const x1 = LayoutEngine.dateToX(s, viewport) - viewport.scrollX;
-                        const x2 = LayoutEngine.dateToX(d + ONE_DAY, viewport) - viewport.scrollX;
+                        const x1 = LayoutEngine.calendarDateToX(s, viewport, 'start') - viewport.scrollX;
+                        const x2 = LayoutEngine.calendarDateToX(d, viewport, 'end') - viewport.scrollX;
                         const y = row.rowIndex * viewport.rowHeight - viewport.scrollY;
                         this.drawVersionSummaryBar(ctx, x1, x2, y, viewport.rowHeight, row.ratioDone ?? 0);
                         if (showTaskTitles) {
@@ -128,29 +130,61 @@ export class TaskRenderer {
                 if (showBaseline) {
                     this.drawBaselineMarker(ctx, task, bounds, baselineSnapshot);
                 }
-            } else if (showPointsOrphans && Number.isFinite(task.startDate)) {
+            } else if (showStartDateOnly && Number.isFinite(task.startDate)) {
                 // Only Start Date -> Draw as a point (triangle_right)
                 // Position orphan points at the center of the day cell.
-                const startDate = LayoutEngine.snapDate(task.startDate, zoomLevel) + ONE_DAY / 2;
-                const startX = LayoutEngine.dateToX(startDate, viewport) - viewport.scrollX;
-                this.drawTaskAsPoint(ctx, task, startX, rowY, viewport.rowHeight, 'triangle_right');
+                const startDate = LayoutEngine.snapDate(task.startDate, zoomLevel);
+                const startX = LayoutEngine.calendarDateToX(startDate, viewport, 'center') - viewport.scrollX;
+                this.drawTaskAsPoint(ctx, task, startX, rowY, viewport.rowHeight, 'triangle_right', today);
 
+                if (showTaskBarDates) {
+                    this.drawTaskBarDates(ctx, task, {
+                        x: startX,
+                        y: rowY + (viewport.rowHeight - 12) / 2,
+                        width: 0,
+                        height: 12
+                    }, TaskRenderer.TASK_START_POINT_DATE_GAP);
+                }
                 if (showTaskTitles) {
-                    this.drawSubjectBeforeBar(ctx, task, startX, rowY + (viewport.rowHeight - 12) / 2, 12, 12);
+                    this.drawSubjectBeforeBar(
+                        ctx,
+                        task,
+                        startX,
+                        rowY + (viewport.rowHeight - 12) / 2,
+                        12,
+                        12,
+                        showTaskBarDates ? TaskRenderer.TASK_TITLE_OFFSET_WITH_DATES : TaskRenderer.TASK_TITLE_OFFSET
+                    );
                 }
                 if (showBaseline) {
                     const pointBounds = LayoutEngine.getTaskBounds(task, viewport, 'bar', zoomLevel);
                     this.drawBaselineMarker(ctx, task, pointBounds, baselineSnapshot);
                 }
-            } else if (showPointsOrphans && Number.isFinite(task.dueDate)) {
+            } else if (showDueDateOnly && Number.isFinite(task.dueDate)) {
                 // Only Due Date -> Draw as a point (diamond)
                 // Position orphan points at the center of the day cell.
-                const dueDate = LayoutEngine.snapDate(task.dueDate, zoomLevel) + ONE_DAY / 2;
-                const dueX = LayoutEngine.dateToX(dueDate, viewport) - viewport.scrollX;
-                this.drawTaskAsPoint(ctx, task, dueX, rowY, viewport.rowHeight, 'diamond');
+                const dueDate = LayoutEngine.snapDate(task.dueDate, zoomLevel);
+                const dueX = LayoutEngine.calendarDateToX(dueDate, viewport, 'center') - viewport.scrollX;
+                this.drawTaskAsPoint(ctx, task, dueX, rowY, viewport.rowHeight, 'diamond', today);
 
+                if (showTaskBarDates) {
+                    this.drawTaskBarDates(ctx, task, {
+                        x: dueX,
+                        y: rowY + (viewport.rowHeight - 12) / 2,
+                        width: 0,
+                        height: 12
+                    });
+                }
                 if (showTaskTitles) {
-                    this.drawSubjectBeforeBar(ctx, task, dueX, rowY + (viewport.rowHeight - 12) / 2, 12, 12);
+                    this.drawSubjectBeforeBar(
+                        ctx,
+                        task,
+                        dueX,
+                        rowY + (viewport.rowHeight - 12) / 2,
+                        12,
+                        12,
+                        showTaskBarDates ? TaskRenderer.TASK_TITLE_OFFSET_WITH_DATES : TaskRenderer.TASK_TITLE_OFFSET
+                    );
                 }
                 if (showBaseline) {
                     const pointBounds = LayoutEngine.getTaskBounds(task, viewport, 'bar', zoomLevel);
@@ -273,13 +307,12 @@ export class TaskRenderer {
     private drawTaskBarDates(
         ctx: CanvasRenderingContext2D,
         task: Task,
-        bar: { x: number; y: number; width: number; height: number }
+        bar: { x: number; y: number; width: number; height: number },
+        dateGap = TaskRenderer.TASK_BAR_DATE_GAP
     ) {
-        if (task.startDate === undefined || task.dueDate === undefined) return;
-
         const formatDate = (timestamp: number) => {
-            const date = new Date(timestamp);
-            return `${date.getMonth() + 1}/${date.getDate()}`;
+            const [, month, day] = calendarDateKey(timestamp).split('-');
+            return `${Number(month)}/${Number(day)}`;
         };
 
         const textY = bar.y + bar.height / 2;
@@ -288,18 +321,24 @@ export class TaskRenderer {
         ctx.fillStyle = designTokens.textMuted;
         ctx.textBaseline = 'middle';
 
-        ctx.textAlign = 'right';
-        ctx.fillText(
-            formatDate(task.startDate),
-            snapTextPosition(bar.x - TaskRenderer.TASK_BAR_DATE_GAP),
-            snapTextPosition(textY)
-        );
-        ctx.textAlign = 'left';
-        ctx.fillText(
-            formatDate(task.dueDate),
-            snapTextPosition(bar.x + bar.width + TaskRenderer.TASK_BAR_DATE_GAP),
-            snapTextPosition(textY)
-        );
+        const startDate = task.startDate;
+        if (startDate !== undefined && Number.isFinite(startDate)) {
+            ctx.textAlign = 'right';
+            ctx.fillText(
+                formatDate(startDate),
+                snapTextPosition(bar.x - dateGap),
+                snapTextPosition(textY)
+            );
+        }
+        const dueDate = task.dueDate;
+        if (dueDate !== undefined && Number.isFinite(dueDate)) {
+            ctx.textAlign = 'left';
+            ctx.fillText(
+                formatDate(dueDate),
+                snapTextPosition(bar.x + bar.width + dateGap),
+                snapTextPosition(textY)
+            );
+        }
         ctx.restore();
     }
 
@@ -494,7 +533,8 @@ export class TaskRenderer {
         x: number,
         y: number,
         rowHeight: number,
-        shape: 'diamond' | 'triangle_left' | 'triangle_right' = 'diamond'
+        shape: 'diamond' | 'triangle_left' | 'triangle_right' = 'diamond',
+        today: CalendarDate
     ) {
         if (!Number.isFinite(x)) return;
 
@@ -505,14 +545,13 @@ export class TaskRenderer {
 
         // Color determination
         let color: string = TaskRenderer.PLAN_GRAY;
-        const now = new Date().setHours(0, 0, 0, 0);
         let isDelayed = false;
 
         const taskDate = Number.isFinite(task.startDate) ? task.startDate : task.dueDate;
 
         if (task.ratioDone === 100) {
             color = TaskRenderer.DONE_GREEN;
-        } else if (taskDate && taskDate < now) {
+        } else if (taskDate !== undefined && taskDate < today) {
             // date is in the past and not done
             color = TaskRenderer.DELAY_RED;
             isDelayed = true;
