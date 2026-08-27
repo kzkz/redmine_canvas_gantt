@@ -49,3 +49,6 @@ Thumbs.db
 spa/bench/results/
 .agents/
 
+
+# 祝日ジェネレータの出力 (環境ごとに生成するため追跡しない)
+tools/holiday_generator/generated/
